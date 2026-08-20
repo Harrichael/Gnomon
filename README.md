@@ -171,6 +171,20 @@ bumped on every redraw. Tie-break on `rowid`.
 by age lets one session harvest another live session's baseline — including the
 row for the turn in progress.
 
+Two of the invariants above are guarded by mutation-checked tests rather than by
+assertion alone. Deleting the response-fold gate in `turn_tokens`, or moving the
+`pcr`/`pout` writes after it, each leaves every other check in both suites green
+— only `[1b]` fails. If you touch that loop, re-run the mutants:
+
+```sh
+python3 - <<'EOF'
+import io; s = io.open("statusline.py").read()
+io.open("/tmp/mut.py","w").write(s.replace(
+    "                if rid in seen:\n                    continue\n                seen.add(rid)\n", ""))
+EOF
+SL_SCRIPT=/tmp/mut.py python3 tests/test_render.py   # must report exactly 2 failures
+```
+
 ## Known limitations
 
 - **A subagent's context-window size is inferred**, since nothing on disk states

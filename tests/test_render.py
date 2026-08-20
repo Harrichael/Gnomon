@@ -70,6 +70,56 @@ rc, o = run(payload("AAA", 5000))
 check("first turn A: up (break cond. at BOF)", grab(o, "⇧"), "100")
 check("first turn A: no ctx delta (no prev)", parens_after(o, "↓"), None)
 
+print("\n[1b] one API response spans several entries — count it once")
+
+# A single response is written as one entry per content block (thinking, text,
+# each tool_use), every entry repeating the SAME message.id and the SAME usage.
+# Summing per entry inflated ⇧ 2-4x; folding on the id is what fixed it.
+#
+# This section exists because every OTHER parent fixture here builds assistant
+# entries with no message.id at all, so `rid` is always None and the fold gate
+# never executes. Deleting the gate left the whole suite green. Both shapes are
+# real — older transcripts carry no id — so the no-id fixtures stay as they are
+# and this one guards the gate.
+
+def AD(mid, i, cw, cr, out):
+    return {"type": "assistant", "message": {"role": "assistant", "id": mid,
+            "usage": {"input_tokens": i, "cache_creation_input_tokens": cw,
+                      "cache_read_input_tokens": cr, "output_tokens": out}}}
+
+DUP = os.path.join(T, "dup.jsonl")
+with open(DUP, "w") as f:
+    # r1 and r2 interleave, so a fold that only collapses ADJACENT duplicates
+    # passes the simple case and fails here.
+    for e in [U("PRE"), A(1, 1, 100, 1),
+              U("DUP"),
+              AD("r1", 100, 900, 5000, 2),      # early streaming placeholder
+              AD("r2", 10, 90, 6000, 3),
+              AD("r1", 100, 900, 5000, 40),
+              AD("r1", 100, 900, 5000, 40),
+              AD("r2", 10, 90, 6000, 77)]:
+        f.write(json.dumps(e) + "\n")
+
+rc, o = run(payload("DUP", 5000, sid="DUP1", tr=DUP))
+# folded: (100+900) + (10+90) = 1100.  unfolded: 3*1000 + 2*100 = 3200
+check("five entries, two responses: ⇧ counts each once", grab(o, "⇧"), "1.1K")
+
+# The cost split needs cache_read counted ONCE per response and output taken as
+# the MAX across its entries — the early streaming records carry placeholders
+# (2 here, where the truth is 40). Both are recorded BEFORE the fold gate;
+# moving them after it silently guts the parent's weight, which no visible
+# figure would reveal, so assert on the stored weight directly.
+DBP = os.path.join(HOME, ".claude", "statusline-state.db")
+run(payload("DUP", 5000, cost=1.0, sid="DUPW", tr=DUP))   # first sight, spent 0
+run(payload("DUP", 5000, cost=2.0, sid="DUPW", tr=DUP))   # paid: w_last advances
+_c = __import__("sqlite3").connect(DBP)
+_w = _c.execute("SELECT w_last FROM agent WHERE session_id='DUPW' "
+                "AND agent_id=''").fetchone()
+_c.close()
+check("parent weight folds reads, takes max output",
+      round(_w[0], 1) if _w else None,
+      round(1.25 * 1100 + 0.1 * (5000 + 6000) + 5.0 * (40 + 77), 1))
+
 print("\n[2] cost delta")
 db = os.path.join(HOME, ".claude", "statusline-state.db")
 for f in (db, db + "-wal", db + "-shm"):
