@@ -2,8 +2,16 @@
 """cc-statusline — three-line Claude Code status line.
 
 Line 1  identity   model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
-Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added) │ ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
+Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added)  ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
+Line 2b agents     ⇉ model  ███░░░ 38%  ⇧up  ⇩out  ⏱ran  (+$spent)  name ✓
 Line 3  limits     5h ●●●◑○ 62% ↻2h11m │ 7d ●◑○○○○○ 23% ↻4d6h │ fable ●●●◑○○○ 51% ↻3d1h
+
+Line 2b appears once per subagent this turn and disappears when none ran. A turn
+that delegates would otherwise read as a flat context bar and a still transcript
+while the cost climbed: the agents' traffic is real but lands in their own files.
+Rows persist until the next prompt so a finished agent can still be read; ✓ marks
+one that is done. Their cost is measured a redraw at a time rather than modelled
+from a price table — see attribute().
 
 Dots FILL  = share of that window's quota consumed (partial dot = quarter steps).
 Dots COLOR = red once REDLINE% of the quota is gone no matter how much of the
@@ -67,6 +75,12 @@ Env knobs:
   CC_SL_STATE_DB     override the state file (default ~/.claude/statusline-state.db)
   CC_SL_SCAN_CAP     bytes of transcript the turn scan may walk (default 4M)
   CC_SL_NO_STATE=1   skip SQLite entirely; drops the $ delta, keeps ↓/⇧
+  CC_SL_NO_AGENTS=1  drop the per-subagent rows; output returns to three lines
+  CC_SL_AGENT_MAX    subagent rows before "… +N more" (default 6, 0 = unlimited)
+  CC_SL_AGENT_STALE  seconds of agent silence before it counts as finished
+                     (default 300; 0 disables the reap)
+  CC_SL_AGENT_CTX    context-window denominator for an agent whose window can't
+                     be inferred (default 200000)
   CC_SL_NO_K8S=1     skip the kubectl probe
   CC_SL_NO_GIT=1     skip the git probe
 """
@@ -233,6 +247,7 @@ GITC = "\033[31m"              # branch
 GITN = "\033[2;33m"            # change count
 IN_C = "\033[38;5;69m"         # ↓ input tokens
 OUT_C = "\033[38;5;141m"       # ↑ output tokens
+GEN_C = "\033[38;5;108m"       # ⇩ tokens an agent generated
 MONEY = "\033[38;5;220m"
 GRY = "\033[38;5;243m"
 
@@ -254,9 +269,19 @@ STATE_DB = os.path.expanduser(E("CC_SL_STATE_DB")
 STATE_TTL = int(num(E("CC_SL_STATE_TTL"), 604800))
 # Ceiling on the backward transcript walk, in bytes.
 SCAN_CAP = int(num(E("CC_SL_SCAN_CAP"), 4 << 20))
+# Subagent rows. STALE is generous on purpose: a live agent blocked inside a
+# long tool call writes nothing for minutes, and measured gaps inside genuinely
+# running agents already reach ~110s on short read-only work.
+AGENT_STALE = int(num(E("CC_SL_AGENT_STALE"), 300))
+AGENT_MAX = int(num(E("CC_SL_AGENT_MAX"), 6))
+AGENT_CTX = int(num(E("CC_SL_AGENT_CTX"), 200000))
 CK = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 SEP = f" {DIM}│{R} "
+# Leading ESC, not decoration: Claude Code trim()s every line, so plain spaces
+# would vanish. trim() stops at the escape, and the reset also cancels the SGR
+# carry-over the renderer applies from the line above.
+PAD = f"{R}  "
 ANSI = re.compile(r"\033\[[0-9;]*m|\033\].*?\033\\")
 
 
@@ -365,8 +390,29 @@ def fmt_dur(ms):
     return f"{m}m" if m else f"{sec}s"
 
 
-def subagent_tokens(path, pid, seen):
-    """Tokens uploaded by subagents this turn — delegated work is still your spend.
+def weigh(up, cr, out):
+    """A price-shaped proxy for tokens, used only to split one redraw interval.
+
+    Cache writes cost ~1.25x fresh input, cache reads a tenth, output ~5x. `up`
+    folds input and cache writes together -- writes dominate it by four orders of
+    magnitude, so pricing the pair at the write rate is close enough for a split.
+    Absolute scale is irrelevant: every use divides one weight by a sum of them.
+    """
+    return 1.25 * up + 0.1 * cr + 5.0 * out
+
+
+def agent_meta(jsonl_path):
+    """`description` / `spawnDepth` / `parentAgentId` from the sibling meta file."""
+    try:
+        with open(jsonl_path[:-6] + ".meta.json", "rb") as fh:
+            m = json.loads(fh.read())
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+
+def subagent_scan(path, pid, seen):
+    """Per-agent traffic for this turn, plus the shared upload total.
 
     Claude Code writes each agent to its own transcript beside the parent's, one
     file per agent and nested agents too:
@@ -376,24 +422,36 @@ def subagent_tokens(path, pid, seen):
 
     Every entry in those files carries the PARENT's promptId, so a file belongs
     wholly to one turn and its first line settles which. Skipping on that keeps
-    the common case to one readline per agent.
+    a foreign agent to one readline instead of a 400KB read.
 
     Don't be tempted by `toolUseResult.totalTokens` in the parent transcript: it
     is the agent's final request context size, not its cumulative spend, it
     omits nested agents, and it only appears once the agent finishes.
 
-    `seen` is shared with the parent scan — ids are unique, so one set stops any
-    entry being counted twice.
+    Two independent dedupes, on purpose. `seen` is shared with the parent scan
+    so the line-2 total counts each response once across every file. The
+    per-file dicts are separate because folding them into `seen` would zero an
+    agent's own numbers whenever the parent happened to touch that id first.
+    Uploaded takes first-wins (input/cache_creation repeat identically), but
+    OUTPUT must take the max: the early streaming records for a response carry a
+    placeholder of 1-5 tokens, so first-wins reports 218 where the truth is
+    28,425.
+
+    Returns (up_total, recs, child_done, child_res). child_done is agent ids
+    whose completion was recorded inside another AGENT's file, which is where a
+    nested agent's result lands rather than in the parent transcript; child_res
+    maps agent id to resolvedModel, the only source of the [1m] window marker.
     """
-    up = 0
+    recs, up_total, child_done, child_res = [], 0, set(), {}
     try:
         base = path[:-6] if path.endswith(".jsonl") else path
         files = glob.glob(os.path.join(base, "subagents", "agent-*.jsonl"))
     except Exception:
-        return 0
+        return 0, [], child_done, child_res
     for f in files:
         try:
-            if os.path.getsize(f) > SCAN_CAP:
+            st = os.stat(f)
+            if st.st_size > SCAN_CAP:
                 continue
             with open(f, "rb") as fh:
                 owner = None
@@ -412,6 +470,10 @@ def subagent_tokens(path, pid, seen):
                     continue            # someone else's agent: never read the body
                 fh.seek(0)
                 lines = fh.read().split(b"\n")
+            up, out, cr = {}, {}, {}
+            up_free = 0                 # records with no id to fold on
+            aid = model = stop = t0 = tend = None
+            ctx = 0
             for ln in lines:
                 if not ln.strip():
                     continue
@@ -419,20 +481,71 @@ def subagent_tokens(path, pid, seen):
                     o = json.loads(ln)
                 except Exception:
                     continue
+                if t0 is None:
+                    t0 = o.get("timestamp")
+                tend = o.get("timestamp") or tend
+                aid = aid or o.get("agentId")
+                t = o.get("toolUseResult")
+                # An async agent gets a toolUseResult at LAUNCH, so the record
+                # existing is not proof of death -- only its status is.
+                if isinstance(t, dict) and t.get("agentId"):
+                    if t.get("status") != "async_launched":
+                        child_done.add(t["agentId"])
+                    if t.get("resolvedModel"):
+                        child_res[t["agentId"]] = t["resolvedModel"]
                 m = o.get("message") or {}
                 u = m.get("usage")
                 if not isinstance(u, dict):
                     continue
                 rid = m.get("id") or o.get("requestId")
-                if rid is not None:
-                    if rid in seen:
-                        continue
-                    seen.add(rid)
-                up += int(num(u.get("input_tokens"))
-                          + num(u.get("cache_creation_input_tokens")))
+                inp = num(u.get("input_tokens")) + num(u.get("cache_creation_input_tokens"))
+                if rid is None:
+                    up_total += int(inp)
+                    up_free += inp
+                else:
+                    if rid not in seen:
+                        seen.add(rid)
+                        up_total += int(inp)
+                    if rid not in up:
+                        up[rid] = inp
+                    cr[rid] = num(u.get("cache_read_input_tokens"))
+                    out[rid] = max(out.get(rid, 0), num(u.get("output_tokens")))
+                if o.get("type") == "assistant":
+                    ctx = int(sum(num(u.get(k)) for k in CK))
+                    model = m.get("model") or model
+                    stop = m.get("stop_reason")
+            meta = agent_meta(f)
+            recs.append({
+                "aid": aid or os.path.basename(f)[6:-6],
+                "depth": max(1, int(num(meta.get("spawnDepth"), 1))),
+                "par": meta.get("parentAgentId"),
+                "name": (meta.get("description") or meta.get("agentType")
+                         or "agent"),
+                "model": model or "",
+                "ctx": ctx,
+                "up": int(sum(up.values()) + up_free),
+                "cr": int(sum(cr.values())),
+                "out": int(sum(out.values())),
+                "stop": stop,
+                "t0": t0,
+                "tend": tend,
+                "mtime": int(st.st_mtime),
+            })
         except Exception:
             continue
-    return up
+    return up_total, recs, child_done, child_res
+
+
+def agent_done(rec, done_ids):
+    """Finished? Used only for the tick mark, so a wrong answer costs a glyph.
+
+    Only `end_turn` ends a turn -- `max_tokens`, `pause_turn` and `tool_use` all
+    continue, and a null stop_reason is normal mid-stream. Staleness is the only
+    signal that reaps an agent someone cancelled, whose file just stops.
+    """
+    return bool(rec["aid"] in done_ids
+                or rec["stop"] == "end_turn"
+                or (AGENT_STALE > 0 and NOW - rec["mtime"] > AGENT_STALE))
 
 
 def turn_tokens(path, pid, chunk=65536):
@@ -454,12 +567,12 @@ def turn_tokens(path, pid, chunk=65536):
     ~99% of the bytes but a tenth of the price, so including them would track how
     hard the agent worked instead of what it cost.
 
-    Returns (uploaded, prev_ctx). prev_ctx is None when the preceding turn's
-    context size can't be established — the caller must then show no delta rather
-    than invent a baseline.
+    Returns (uploaded, prev_ctx, agents, parent_weight). prev_ctx is None when
+    the preceding turn's context size can't be established — the caller must then show no delta
+    rather than invent a baseline.
     """
     if not path or not pid:
-        return 0, None
+        return 0, None, [], 0.0
     try:
         size = os.path.getsize(path)
         pos, buf, objs, start = size, b"", [], None
@@ -491,7 +604,7 @@ def turn_tokens(path, pid, chunk=65536):
                         for o in objs[:start]):
                     break
         if start is None:
-            return 0, None
+            return 0, None, [], 0.0
         end = next((i for i in range(start + 1, len(objs))
                     if objs[i].get("type") == "user" and objs[i].get("promptId")
                     and objs[i]["promptId"] != pid), len(objs))
@@ -501,8 +614,15 @@ def turn_tokens(path, pid, chunk=65536):
             if isinstance(u, dict):
                 prev = int(sum(num(u.get(k)) for k in CK))
                 break
-        up, seen = 0, set()
+        up, seen, parent_done, parent_res = 0, set(), set(), {}
+        pcr, pout = {}, {}
         for o in objs[start:end]:
+            t = o.get("toolUseResult")
+            if isinstance(t, dict) and t.get("agentId"):
+                if t.get("status") != "async_launched":
+                    parent_done.add(t["agentId"])
+                if t.get("resolvedModel"):
+                    parent_res[t["agentId"]] = t["resolvedModel"]
             m = o.get("message") or {}
             u = m.get("usage")
             if not isinstance(u, dict):
@@ -513,15 +633,27 @@ def turn_tokens(path, pid, chunk=65536):
             # response id and count each response once.
             rid = m.get("id") or o.get("requestId")
             if rid is not None:
+                # Recorded before the dedupe gate: output needs max-per-id, and
+                # these feed only the cost split, never the displayed totals.
+                pcr[rid] = num(u.get("cache_read_input_tokens"))
+                pout[rid] = max(pout.get(rid, 0), num(u.get("output_tokens")))
                 if rid in seen:
                     continue
                 seen.add(rid)
             up += int(num(u.get("input_tokens"))
                       + num(u.get("cache_creation_input_tokens")))
-        up += subagent_tokens(path, pid, seen)
-        return up, prev
+        pw = weigh(up, sum(pcr.values()), sum(pout.values()))
+        sub_up, agents, child_done, child_res = subagent_scan(path, pid, seen)
+        up += sub_up
+        done_ids = parent_done | child_done
+        res = dict(child_res); res.update(parent_res)
+        for a in agents:
+            a["done"] = agent_done(a, done_ids)
+            a["res"] = res.get(a["aid"], "")
+        agents.sort(key=lambda a: (a["t0"] or "", a["aid"]))
+        return up, prev, agents, pw
     except Exception:
-        return 0, None
+        return 0, None, [], 0.0
 
 
 def clamp_base(base, cost_now):
@@ -536,7 +668,77 @@ def clamp_base(base, cost_now):
     return cost_now if base > cost_now else base
 
 
-def cost_delta(sid, pid, cost_now):
+def attribute(con, sid, pid, spent, agents, parent_w, main_model):
+    """Split the money spent since the last redraw across whoever did work.
+
+    Per-agent cost is recorded nowhere, and a price table fitted to turn-level
+    history does not survive contact with the data — parent and agent spend are
+    entangled there, and the residuals come out the same size as the values. So
+    measure it one redraw interval at a time instead: whatever the cumulative
+    cost moved by belongs to whoever's token count moved with it.
+
+    When exactly ONE participant grew, that interval is exact and needs no
+    weighting at all — the common case, since sequential delegation only ever
+    has one thing running. It is also the only clean observation of a model's
+    price, so those intervals are the sole input to `model_rate`; anything with
+    two movers is contaminated and is never used for calibration.
+
+    Concurrent movers split the interval by weighted growth, priced with the
+    rates learned so far. An uncalibrated model falls back to the mean of the
+    known rates rather than a bare 1.0, which would otherwise dwarf real rates
+    (dollars per token are ~1e-6) and hand it the whole interval.
+
+    The parent rides along as agent_id "" so the parts always sum to the turn.
+    """
+    prior = {r[0]: (float(r[1]), float(r[2])) for r in con.execute(
+        "SELECT agent_id, cost, w_last FROM agent "
+        "WHERE session_id=? AND prompt_id=?", (sid, pid))}
+    parts = [("", main_model, parent_w)]
+    for a in agents:
+        parts.append((a["aid"], a["model"],
+                      weigh(a["up"], a.get("cr", 0), a["out"])))
+    grew = [(aid, mdl, w, w - prior.get(aid, (0.0, 0.0))[1]) for aid, mdl, w in parts]
+    grew = [g for g in grew if g[3] > 0]
+
+    share = {}
+    if spent > 0:
+        if len(grew) == 1:
+            aid, mdl, _w, dw = grew[0]
+            share[aid] = spent
+            if aid and mdl and dw > 0:
+                con.execute("INSERT INTO model_rate VALUES (?,?,?,?) "
+                            "ON CONFLICT(model) DO UPDATE SET w=w+excluded.w, "
+                            "usd=usd+excluded.usd, updated_at=excluded.updated_at",
+                            (mdl, dw, spent, NOW))
+        elif len(grew) > 1:
+            known = {}
+            for m_, w_, u_ in con.execute("SELECT model, w, usd FROM model_rate"):
+                if float(w_) > 0:
+                    known[m_] = float(u_) / float(w_)
+            dflt = (sum(known.values()) / len(known)) if known else 1.0
+            wts = [(aid, dw * known.get(mdl, dflt)) for aid, mdl, _w, dw in grew]
+            tot = sum(x[1] for x in wts)
+            for aid, x in wts:
+                share[aid] = spent * x / tot if tot > 0 else 0.0
+            if tot <= 0:
+                share[""] = spent
+        else:
+            # Nobody's tokens moved. The transcript lags stdin by a flush, so
+            # money can land before the records that explain it — bank it on the
+            # parent rather than lose it, or the parts stop summing to the turn.
+            share[""] = spent
+
+    out = {}
+    for aid, _mdl, w in parts:
+        cost = prior.get(aid, (0.0, 0.0))[0] + share.get(aid, 0.0)
+        con.execute("INSERT OR REPLACE INTO agent VALUES (?,?,?,?,?,?)",
+                    (sid, pid, aid, cost, w, NOW))
+        if aid:
+            out[aid] = cost
+    return out
+
+
+def cost_delta(sid, pid, cost_now, agents=(), parent_w=0.0, main_model=""):
     """Dollars burned since the current human turn began, or None.
 
     Cost is the one figure absent from the transcript, so it needs a baseline on
@@ -544,9 +746,11 @@ def cost_delta(sid, pid, cost_now):
     single place to expire from instead of a litter of per-session files. Every
     failure path returns None so the caller drops the delta and leaves the rest
     of the line untouched — a status line must never crash or hang.
+
+    Returns (turn_delta, {agent_id: dollars}); (None, {}) on any failure.
     """
     if E("CC_SL_NO_STATE") or not sid or not pid:
-        return None
+        return None, {}
     con = None
     try:
         import sqlite3
@@ -562,7 +766,21 @@ def cost_delta(sid, pid, cost_now):
                          updated_at INTEGER NOT NULL,
                          PRIMARY KEY (session_id, prompt_id))""")
         con.execute("CREATE INDEX IF NOT EXISTS turn_age ON turn(updated_at)")
-        row = con.execute("SELECT cost_start FROM turn "
+        con.execute("""CREATE TABLE IF NOT EXISTS agent (
+                         session_id TEXT NOT NULL,
+                         prompt_id  TEXT NOT NULL,
+                         agent_id   TEXT NOT NULL,
+                         cost       REAL NOT NULL,
+                         w_last     REAL NOT NULL,
+                         updated_at INTEGER NOT NULL,
+                         PRIMARY KEY (session_id, prompt_id, agent_id))""")
+        con.execute("CREATE INDEX IF NOT EXISTS agent_age ON agent(updated_at)")
+        con.execute("""CREATE TABLE IF NOT EXISTS model_rate (
+                         model      TEXT PRIMARY KEY,
+                         w          REAL NOT NULL,
+                         usd        REAL NOT NULL,
+                         updated_at INTEGER NOT NULL)""")
+        row = con.execute("SELECT cost_start, cost_last FROM turn "
                           "WHERE session_id=? AND prompt_id=?", (sid, pid)).fetchone()
         if row is None:
             # New turn. Baseline off the previous turn's last reading rather than
@@ -583,6 +801,7 @@ def cost_delta(sid, pid, cost_now):
             # the live reading costs only the sliver spent before first redraw.
             base = float(prev[0]) if prev else cost_now
             base = clamp_base(base, cost_now)
+            prev_read = base            # first sight: the turn starts here
             con.execute("INSERT OR REPLACE INTO turn VALUES (?,?,?,?,?)",
                         (sid, pid, base, cost_now, NOW))
             # GC on turn boundaries only — once per human prompt, not per redraw.
@@ -592,15 +811,27 @@ def cost_delta(sid, pid, cost_now):
             con.execute("DELETE FROM turn WHERE session_id <> ? AND session_id IN ("
                         " SELECT session_id FROM turn GROUP BY session_id"
                         "  HAVING MAX(updated_at) < ?)", (sid, NOW - STATE_TTL))
+            con.execute("DELETE FROM agent WHERE session_id <> ? AND session_id IN ("
+                        " SELECT session_id FROM agent GROUP BY session_id"
+                        "  HAVING MAX(updated_at) < ?)", (sid, NOW - STATE_TTL))
         else:
             # Write the clamp back so a re-anchored turn stays re-anchored.
             base = clamp_base(float(row[0]), cost_now)
+            prev_read = max(base, float(row[1]))
             con.execute("UPDATE turn SET cost_start=?, cost_last=?, updated_at=? "
                         "WHERE session_id=? AND prompt_id=?",
                         (base, cost_now, NOW, sid, pid))
-        return max(0.0, cost_now - base)
+        costs = {}
+        try:
+            # Isolated: a failure here must cost the per-agent figures only, not
+            # the turn delta that line 2 depends on.
+            costs = attribute(con, sid, pid, max(0.0, cost_now - prev_read),
+                              agents, parent_w, main_model)
+        except Exception:
+            costs = {}
+        return max(0.0, cost_now - base), costs
     except Exception:
-        return None
+        return None, {}
     finally:
         if con is not None:
             try:
@@ -638,7 +869,7 @@ if not tin:
     if isinstance(cu, dict):
         tin = int(sum(num(cu.get(k)) for k in CK))
 
-up, prev_ctx = turn_tokens(transcript, prompt_id)
+up, prev_ctx, agents, parent_w = turn_tokens(transcript, prompt_id)
 
 ctx_txt = ctx_extra = ""
 if tin:
@@ -655,10 +886,12 @@ lines_txt = f"{GREEN}+{la}{R}{DIM}/{R}{RED}-{lr}{R}" if (la or lr) else ""
 
 # Cost + wall clock — session-scoped, so they live here rather than on line 3.
 money_txt = money_extra = dur_txt = ""
+agent_cost = {}
 cost = num(dig("cost", "total_cost_usd"))
 if cost > 0:
     money_txt = f"{MONEY}${cost:.2f}{R}"
-    d = cost_delta(session_id, prompt_id, cost)
+    d, agent_cost = cost_delta(session_id, prompt_id, cost, agents, parent_w,
+                               dig("model", "display_name", default="") or "")
     if d is not None:
         money_extra = f" {DIM}(+${d:.2f}){R}"
 dur = num(dig("cost", "total_duration_ms"))
@@ -865,7 +1098,137 @@ if COLS and vlen(line3) > COLS:
         if vlen(line3) <= COLS:
             break
 
+# ══ LINE 2b — one row per subagent of this turn ═══════════════════════════════
+def short_model(m):
+    """`claude-haiku-4-5-20251001` -> `haiku`. The family is what tells two
+    agents apart at a glance, and line 1 already carries the model in full."""
+    m = (m or "").lower()
+    for pre in ("claude-", "anthropic."):
+        if m.startswith(pre):
+            m = m[len(pre):]
+    return m.split("-")[0] or "?"
+
+
+def agent_window(rec, main_family, main_win):
+    """How much context the agent is allowed. Nothing on disk states it.
+
+    `resolvedModel` carries the [1m] marker when we have it, but it only appears
+    once an agent finishes (or, for async ones, at launch) — so most of the time
+    the fallback is what runs: an agent on the main model gets the main model's
+    window, anything else the default. A wrong guess reads too full, never too
+    empty, and CC_SL_AGENT_CTX overrides it.
+    """
+    if "[1m]" in (rec.get("res") or ""):
+        return 1000000
+    if main_win and short_model(rec.get("model")) == main_family:
+        return main_win
+    return AGENT_CTX
+
+
+def order_agents(recs):
+    """Depth-first, each agent followed by whatever it spawned.
+
+    Depth comes from the tree rather than meta's spawnDepth: an agent whose
+    parent isn't in this turn's set is a root here whatever its absolute depth.
+    Siblings sort by start time — stable across redraws, unlike mtime, which
+    would make rows jump around as agents write.
+    """
+    by = {r["aid"]: r for r in recs}
+    kids, roots = {}, []
+    for r in recs:
+        par = r.get("par")
+        if par and par in by and par != r["aid"]:
+            kids.setdefault(par, []).append(r)
+        else:
+            roots.append(r)
+    out, seen = [], set()
+
+    def walk(r, depth):
+        if r["aid"] in seen:        # malformed parent chain must not loop
+            return
+        seen.add(r["aid"])
+        out.append(dict(r, depth=depth))
+        for k in sorted(kids.get(r["aid"], []), key=lambda x: (x["t0"] or "", x["aid"])):
+            walk(k, depth + 1)
+
+    for r in sorted(roots, key=lambda x: (x["t0"] or "", x["aid"])):
+        walk(r, 1)
+    for r in recs:                  # anything a cycle stranded still gets a row
+        walk(r, 1)
+    return out
+
+
+def agent_bar(ctx, win):
+    """Six cells against an inferred window, coloured like line 2's bar."""
+    pct = 0 if win <= 0 else max(0, min(100, int(round(ctx * 100.0 / win))))
+    filled = min(6, (pct * 6 + 50) // 100)
+    col = GREEN if pct < 60 else (YELLOW if pct <= 80 else RED)
+    return f"{col}{'█' * filled}{'░' * (6 - filled)} {pct:>3d}%{R}"
+
+
+def compose_agents(rows, costs, main_family, main_win, level=0):
+    """One aligned row per agent. level 1 truncates the name, 2 drops it, 3 also
+    drops the cost, 4 also drops the elapsed time."""
+    if not rows:
+        return []
+    fixed, names = [], []
+    for r in rows:
+        head = "  " * (r["depth"] - 1) + f"{GRY}⇉{R} {ORANGE}{short_model(r['model'])}{R}"
+        seg = [head, agent_bar(r["ctx"], agent_window(r, main_family, main_win)),
+               f"{OUT_C}⇧{R} {fmt_tok(r['up'])}", f"{GEN_C}⇩{R} {fmt_tok(r['out'])}"]
+        if level < 4:
+            t0, t1 = parse_ts(r.get("t0")), parse_ts(r.get("tend"))
+            end = t1 if (r.get("done") and t1) else NOW
+            if t0:
+                seg.append(f"{GRY}⏱ {fmt_dur(max(0, end - t0) * 1000)}{R}")
+        if level < 3 and r["aid"] in costs:
+            seg.append(f"{DIM}(+${costs[r['aid']]:.2f}){R}")
+        fixed.append(seg)
+        names.append(r["name"] + (" ✓" if r.get("done") else ""))
+
+    # Pad each column to the block's widest, so the numbers line up in a column
+    # rather than wherever the model name happens to end.
+    ncol = max(len(f) for f in fixed)
+    widths = [max(vlen(f[i]) for f in fixed if len(f) > i) for i in range(ncol)]
+    body = []
+    for seg in fixed:
+        body.append("  ".join(c + " " * (widths[i] - vlen(c))
+                              for i, c in enumerate(seg)).rstrip())
+
+    if level >= 2:
+        return [PAD + b for b in body]
+    budget = 0
+    if COLS:
+        budget = COLS - vlen(PAD) - max(vlen(b) for b in body) - 2
+        if budget < 6:
+            return [PAD + b for b in body]
+    out = []
+    for b, nm in zip(body, names):
+        if level >= 1 and COLS and len(nm) > budget:
+            nm = nm[:max(0, budget - 1)] + "…"
+        out.append(f"{PAD}{b}  {DIM}{nm}{R}" if nm else PAD + b)
+    return out
+
+
+agent_lines = []
+if agents and not E("CC_SL_NO_AGENTS"):
+    _rows = order_agents(agents)
+    _more = 0
+    if AGENT_MAX > 0 and len(_rows) > AGENT_MAX:
+        _more, _rows = len(_rows) - AGENT_MAX, _rows[:AGENT_MAX]
+    _fam = (dig("model", "display_name", default="") or "").strip().split(" ")[0].lower()
+    _win = int(num(dig("context_window", "context_window_size"), 0))
+    agent_lines = compose_agents(_rows, agent_cost, _fam, _win)
+    if COLS:
+        for _lvl in (1, 2, 3, 4):
+            if max(vlen(l) for l in agent_lines) <= COLS:
+                break
+            agent_lines = compose_agents(_rows, agent_cost, _fam, _win, _lvl)
+    if _more:
+        agent_lines.append(f"{PAD}{DIM}… +{_more} more{R}")
+
+
 # ── emit ──────────────────────────────────────────────────────────────────────
-for ln in (line1, line2, line3):
+for ln in [line1, line2] + agent_lines + [line3]:
     if ln.strip():
         print(ln)

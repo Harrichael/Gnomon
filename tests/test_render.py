@@ -6,6 +6,7 @@ SCRIPT = os.environ.get("SL_SCRIPT") or os.path.expanduser(
 T = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.join(T, "home"); os.makedirs(os.path.join(HOME, ".claude"), exist_ok=True)
 ANSI = re.compile(r"\033\[[0-9;]*m")
+RAW = []   # last raw stdout, for the tests that care about escapes
 fails = []
 
 def U(pid, tool=False):
@@ -33,6 +34,7 @@ def run(stdin, env=None, cols="200"):
     e.update(env or {})
     r = subprocess.run([sys.executable, SCRIPT], input=json.dumps(stdin),
                        capture_output=True, text=True, env=e)
+    RAW.append(r.stdout)
     return r.returncode, ANSI.sub("", r.stdout)
 
 def payload(pid, tin, cost=5.0, sid="S1", tr=TR):
@@ -208,6 +210,242 @@ check("oversized agent files skipped", grab(o, "⇧"), "100")
 # No subagents directory at all — the common case must be untouched.
 rc, o = run(payload("BBB", 5000))
 check("no subagents dir: unchanged", grab(o, "⇧"), "200")
+
+print("\n[7c] subagent rows — delegated work gets its own line")
+AT = os.path.join(T, "ag.jsonl")
+with open(AT, "w") as f:
+    for e in [U("AAA"), A(10, 90, 1000, 5), U("BBB"), A(1, 99, 2000, 10)]:
+        f.write(json.dumps(e) + "\n")
+ASUB = os.path.join(T, "ag", "subagents")
+TS = "2026-08-20T20:00:00.000Z"
+
+
+def AA(model, i, cw, cr, out, mid=None, stop="end_turn", ts=TS):
+    m = {"role": "assistant", "model": model, "stop_reason": stop,
+         "usage": {"input_tokens": i, "cache_creation_input_tokens": cw,
+                   "cache_read_input_tokens": cr, "output_tokens": out}}
+    if mid:
+        m["id"] = mid
+    return {"type": "assistant", "isSidechain": True, "message": m, "timestamp": ts}
+
+
+def agent(aid, pid, entries, name="Agent", depth=1, par=None, meta=None, t0=TS):
+    os.makedirs(ASUB, exist_ok=True)
+    with open(os.path.join(ASUB, "agent-%s.jsonl" % aid), "w") as f:
+        f.write(json.dumps({"type": "user", "isSidechain": True, "promptId": pid,
+                            "agentId": aid, "timestamp": t0,
+                            "message": {"role": "user", "content": "x"}}) + "\n")
+        for e in entries:
+            f.write(json.dumps(dict(e, agentId=aid)) + "\n")
+    if meta is None:
+        meta = {"agentType": "general-purpose", "description": name, "spawnDepth": depth}
+        if par:
+            meta["parentAgentId"] = par
+    if meta is not False:
+        with open(os.path.join(ASUB, "agent-%s.meta.json" % aid), "w") as f:
+            json.dump(meta, f)
+
+
+def wipe():
+    shutil.rmtree(os.path.join(T, "ag"), ignore_errors=True)
+
+
+def rows(out):
+    return [l for l in out.split("\n") if "⇉" in l or "more" in l]
+
+
+# --- 1. nothing changes when no agent ran -------------------------------------
+wipe()
+rc, base3 = run(payload("BBB", 5000, tr=AT))
+check("no subagents: 2 lines (no rate limits in this fixture)",
+      len([l for l in base3.split("\n") if l]), 2)
+
+agent("aaa", "BBB", [AA("claude-fable-5", 2, 400, 9000, 900, mid="m1")], name="Audit thing")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("agent row appears", len(rows(o)), 1)
+rc, o2 = run(payload("BBB", 5000, tr=AT), env={"CC_SL_NO_AGENTS": "1"})
+check("CC_SL_NO_AGENTS=1 restores the un-delegated line count",
+      len([l for l in o2.split("\n") if l]), 2)
+
+# --- 2. line 2's up must absorb the agent, unchanged by the refactor ----------
+check("line 2 ⇧ includes the agent (100 parent + 402 agent)", grab(o, "⇧"), "502")
+
+# --- 3. output dedupe: streaming placeholders share one id --------------------
+wipe()
+agent("bbb", "BBB", [AA("claude-fable-5", 2, 400, 9000, 4, mid="m1"),
+                     AA("claude-fable-5", 2, 400, 9000, 883, mid="m1"),
+                     AA("claude-fable-5", 2, 400, 9000, 883, mid="m1")], name="Dedupe")
+rc, o = run(payload("BBB", 5000, tr=AT))
+r0 = rows(o)[0]
+check("agent ⇩ takes max-per-id, not first or sum", "⇩ 883" in r0, True)
+check("agent ⇧ counts the response once", "⇧ 402" in r0, True)
+
+# non-contiguous duplicate ids must still fold
+wipe()
+agent("ccc", "BBB", [AA("claude-fable-5", 0, 100, 0, 10, mid="mA"),
+                     AA("claude-fable-5", 0, 200, 0, 20, mid="mB"),
+                     AA("claude-fable-5", 0, 100, 0, 55, mid="mA")], name="NonContig")
+rc, o = run(payload("BBB", 5000, tr=AT))
+r0 = rows(o)[0]
+check("non-contiguous ids fold correctly (⇧)", "⇧ 300" in r0, True)
+check("non-contiguous ids fold correctly (⇩)", "⇩ 75" in r0, True)
+
+# --- 4. the tick mark ---------------------------------------------------------
+wipe()
+agent("run", "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="r1", stop="tool_use")],
+      name="Still going")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("stop_reason=tool_use ⇒ no tick", "✓" in rows(o)[0], False)
+for stop in ("max_tokens", "pause_turn", None):
+    wipe()
+    agent("run", "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="r1", stop=stop)], name="X")
+    rc, o = run(payload("BBB", 5000, tr=AT))
+    check("stop_reason=%s ⇒ no tick" % stop, "✓" in rows(o)[0], False)
+wipe()
+agent("fin", "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="f1", stop="end_turn")], name="Done")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("stop_reason=end_turn ⇒ tick", "✓" in rows(o)[0], True)
+
+# a completion recorded in the PARENT, but only when it isn't a launch record
+for status, want in (("async_launched", False), ("completed", True)):
+    wipe()
+    agent("asy", "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="a1", stop="tool_use")], name="Async")
+    with open(AT, "w") as f:
+        for e in [U("AAA"), A(10, 90, 1000, 5), U("BBB"), A(1, 99, 2000, 10)]:
+            f.write(json.dumps(e) + "\n")
+        f.write(json.dumps(dict(U("BBB", True),
+                toolUseResult={"agentId": "asy", "status": status})) + "\n")
+    rc, o = run(payload("BBB", 5000, tr=AT))
+    check("parent toolUseResult status=%s ⇒ tick %s" % (status, want),
+          "✓" in rows(o)[0], want)
+with open(AT, "w") as f:
+    for e in [U("AAA"), A(10, 90, 1000, 5), U("BBB"), A(1, 99, 2000, 10)]:
+        f.write(json.dumps(e) + "\n")
+
+# a nested agent's completion lives in its SPAWNER's file, not the parent's
+wipe()
+agent("par", "BBB", [AA("claude-opus-5", 1, 10, 0, 5, mid="p1", stop="tool_use"),
+                     dict(U("BBB", True), timestamp=TS,
+                          toolUseResult={"agentId": "kid", "status": "completed"})],
+      name="Spawner")
+agent("kid", "BBB", [AA("claude-haiku-4-5-20251001", 1, 10, 0, 5, mid="k1", stop="tool_use")],
+      name="Nested", depth=2, par="par")
+rc, o = run(payload("BBB", 5000, tr=AT))
+rr = rows(o)
+check("nested completion found in spawner's file", sum("✓" in l for l in rr), 1)
+check("child renders under its parent, indented deeper",
+      ANSI.sub("", rr[1]).index("⇉") > ANSI.sub("", rr[0]).index("⇉"), True)
+
+# staleness reaps an agent nobody ever closed out
+wipe()
+agent("old", "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="o1", stop="tool_use")], name="Stale")
+old = time.time() - 4000
+os.utime(os.path.join(ASUB, "agent-old.jsonl"), (old, old))
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("stale agent gets a tick", "✓" in rows(o)[0], True)
+rc, o = run(payload("BBB", 5000, tr=AT), env={"CC_SL_AGENT_STALE": "0"})
+check("CC_SL_AGENT_STALE=0 disables the reap", "✓" in rows(o)[0], False)
+
+# --- 5. the context bar's inferred denominator --------------------------------
+wipe()
+agent("big", "BBB", [AA("claude-opus-5", 0, 0, 100000, 1, mid="b1")], name="Same model")
+agent("sml", "BBB", [AA("claude-fable-5", 0, 0, 100000, 1, mid="s1")], name="Other model")
+def opus_payload():
+    p = payload("BBB", 5000, tr=AT)
+    p["model"]["display_name"] = "Opus 5 (1M context)"
+    return p
+
+
+rc, o = run(opus_payload())
+rr = {ANSI.sub("", l).split("⇉ ")[1].split()[0]: ANSI.sub("", l) for l in rows(o)}
+check("agent on the main model uses the main window (100K/1M)", "10%" in rr["opus"], True)
+check("other model falls back to 200K (100K/200K)", "50%" in rr["fable"], True)
+rc, o = run(opus_payload(), env={"CC_SL_AGENT_CTX": "400000"})
+rr = {ANSI.sub("", l).split("⇉ ")[1].split()[0]: ANSI.sub("", l) for l in rows(o)}
+check("CC_SL_AGENT_CTX overrides the fallback (100K/400K)", "25%" in rr["fable"], True)
+
+# --- 6. indentation must survive Claude Code's per-line trim() ----------------
+def harness(out):
+    """What Claude Code actually renders: .trim().split.flatMap(c=>c.trim()||[])"""
+    return [l for l in (x.strip("\t\r\n  ﻿") for x in out.strip().split("\n")) if l]
+
+
+rc, o = run(payload("BBB", 5000, tr=AT))
+kept = harness(RAW[-1])
+check("no row is dropped by the harness trim", len(kept), len([l for l in o.split("\n") if l]))
+check("agent rows survive trim with their indent",
+      [l.startswith("\033[0m  ") for l in kept if "⇉" in l], [True, True])
+
+# --- 7. alignment holds across wildly different names and magnitudes ----------
+wipe()
+agent("w1", "BBB", [AA("claude-opus-5", 1, 5, 3, 7, mid="w1")], name="a")
+agent("w2", "BBB", [AA("claude-haiku-4-5-20251001", 900000, 900000, 900000, 900000, mid="w2")],
+      name="a much longer agent description here")
+rc, o = run(payload("BBB", 5000, tr=AT))
+plain = [ANSI.sub("", l) for l in rows(o)]
+check("⇧ starts at the same column on every row",
+      len({l.index("⇧") for l in plain}), 1)
+check("⇩ starts at the same column on every row",
+      len({l.index("⇩") for l in plain}), 1)
+
+# --- 8. degradation: every case must still exit 0 -----------------------------
+wipe()
+agent("nm", "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="n1")], meta=False)
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("missing .meta.json: exit 0 and still a row", (rc, len(rows(o))), (0, 1))
+with open(os.path.join(ASUB, "agent-nm.meta.json"), "w") as f:
+    f.write("not json")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("corrupt .meta.json: exit 0", rc, 0)
+with open(os.path.join(ASUB, "agent-nm.meta.json"), "w") as f:
+    f.write("[]")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("wrong-type .meta.json: exit 0", rc, 0)
+with open(os.path.join(ASUB, "agent-nm.jsonl"), "a") as f:
+    f.write('{"type":"assist')
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("truncated agent line: exit 0", rc, 0)
+rc, o = run(payload("BBB", 5000, tr=AT), env={"CC_SL_SCAN_CAP": "40"})
+check("agent over SCAN_CAP is skipped", len(rows(o)), 0)
+os.makedirs(ASUB, exist_ok=True)
+wipe(); os.makedirs(ASUB, exist_ok=True)
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("empty subagents dir: exit 0, no rows", (rc, len(rows(o))), (0, 0))
+
+# an agent belonging to another turn is skipped without its body being read
+wipe()
+agent("other", "ZZZ", [AA("claude-fable-5", 5000, 5000, 0, 5000, mid="z1")], name="Wrong turn")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("agent from another turn: no row", len(rows(o)), 0)
+check("agent from another turn: not counted in ⇧", grab(o, "⇧"), "100")
+
+# --- 9. overflow cap ----------------------------------------------------------
+wipe()
+for i in range(9):
+    agent("m%d" % i, "BBB", [AA("claude-fable-5", 1, 10, 0, 5, mid="m%d" % i)],
+          name="Agent %d" % i, t0="2026-08-20T20:0%d:00.000Z" % i)
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("default cap of 6 rows", len([l for l in rows(o) if "⇉" in l]), 6)
+check("overflow says how many were hidden", "+3 more" in ANSI.sub("", o), True)
+rc, o = run(payload("BBB", 5000, tr=AT), env={"CC_SL_AGENT_MAX": "0"})
+check("CC_SL_AGENT_MAX=0 shows them all", len([l for l in rows(o) if "⇉" in l]), 9)
+
+# --- 10. shedding -------------------------------------------------------------
+wipe()
+agent("s1", "BBB", [AA("claude-fable-5", 2, 400, 9000, 900, mid="q1")],
+      name="A fairly long agent description")
+for cols, want in ((200, "full"), (100, "trunc"), (60, "none"), (46, "nocost")):
+    rc, o = run(payload("BBB", 5000, tr=AT), cols=str(cols))
+    r0 = ANSI.sub("", rows(o)[0])
+    check("COLUMNS=%d row fits" % cols, len(r0) <= cols, True)
+    if want == "full":
+        check("COLUMNS=200 keeps the whole name", r0.endswith("description ✓"), True)
+    if want == "nocost":
+        check("COLUMNS=46 drops the cost", "(+$" in r0, False)
+rc, o = run(payload("BBB", 5000, tr=AT), cols="0")
+check("COLUMNS=0 disables shedding entirely",
+      ANSI.sub("", rows(o)[0]).endswith("description ✓"), True)
+wipe()
 
 print("\n[8] timing")
 pl = json.dumps(payload("CCC", 5000))

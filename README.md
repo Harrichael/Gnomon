@@ -16,8 +16,8 @@ layout, install, and the invariants that are easy to break by accident.
 
     statusline.py            the whole thing; deployed to ~/.claude/statusline.py
     install.sh               runs the tests, then installs + registers it
-    tests/test_render.py     39 checks: rendering, subagents, widths, degradation
-    tests/test_cost_state.py 25 checks: cost baselines, GC, multi-session
+    tests/test_render.py     82 checks: rendering, subagent rows, widths, degradation
+    tests/test_cost_state.py 33 checks: cost baselines, per-agent attribution, GC
     tests/fixtures/          a captured real stdin payload
     archive/                 pre-feature snapshot, kept from before git existed
 
@@ -79,6 +79,30 @@ agent's *final request context size*, not cumulative spend; it omits nested
 agents; and it only appears once the agent finishes. It is the obvious number to
 reach for and it is wrong.
 
+**Leading spaces do not survive.** Claude Code post-processes the command's
+output as `.trim().split("\n").flatMap(c => c.trim() || [])`, so indentation is
+stripped and a line blank after trimming is dropped. Start an indented line with
+an ESC (`\033[0m`) — `trim()` stops there, the real spaces survive, and the reset
+also cancels the SGR carry-over the renderer applies from the line above.
+
+**A `toolUseResult` is not proof an agent finished.** An *async* agent gets one at
+**launch**, with `status: "async_launched"`. Only a status that isn't that means
+done. And a nested agent's completion is recorded in its **spawner's** file, not
+the parent transcript, so both have to be scanned.
+
+**Output tokens need max-per-message-id, uploads do not.** The early streaming
+records for a response carry a placeholder `output_tokens` of 1–5 while
+`input`/`cache_creation` are already final. First-wins gives 218 where the truth
+is 28,425.
+
+**Per-agent cost is measured, never modelled.** Fitting a per-model price table to
+turn-level history does not work — parent and agent spend are entangled there and
+the residuals come out the size of the values. Instead each redraw's cost movement
+is attributed to whoever's tokens moved with it: exact when one agent runs alone,
+weighted only when several run in the same interval, and the parts always sum to
+the turn. Solo intervals are also the only clean per-model price observation, so
+they are the sole input to the learned rates.
+
 **An unknown cost baseline is not zero.** `total_cost_usd` accumulates per
 *process*, so treating a missing baseline as 0 bills one turn for the whole
 session. Anchor on the live reading instead.
@@ -97,6 +121,13 @@ row for the turn in progress.
 
 ## Known limitations
 
+- **A subagent's context-window size is inferred**, since nothing on disk states
+  it. An agent on the main model borrows the main window, `resolvedModel`'s `[1m]`
+  marker is honoured when present, and everything else falls back to
+  `CC_SL_AGENT_CTX`. A wrong guess makes the bar read too full, never too empty.
+- **An async agent that outlives its turn disappears** from the rows at the next
+  prompt while still burning tokens. Rows are `promptId`-scoped, which is what
+  keeps the scan bounded and the no-agent case free.
 - **A resumed session's first turn under-reports** by whatever was spent before
   its first redraw — bounded by `refreshInterval`, so ≤10 s of spend.
 - **Retention is per-session, not per-row.** A session left open forever keeps

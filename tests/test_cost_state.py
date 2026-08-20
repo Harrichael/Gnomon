@@ -1,5 +1,5 @@
 """Focused suite for the three cost-baseline fixes + multi-session safety."""
-import json, os, re, sqlite3, subprocess, sys, tempfile, time
+import json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time
 
 # Defaults to the deployed script; set SL_SCRIPT to test the repo copy
 # before installing it.
@@ -15,15 +15,18 @@ def check(name, got, want):
     else: FAIL += 1
     print("  %s  %-52s got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
 
-def run(db, sid, pid, cost, ttl=None, env=None):
+def run(db, sid, pid, cost, ttl=None, env=None, tr=None):
     e = dict(os.environ)
     e.update({"CC_SL_STATE_DB": db, "CC_SL_NO_API": "1", "CC_SL_NO_GIT": "1",
               "CC_SL_NO_K8S": "1", "COLUMNS": "400", "LC_ALL": "en_US.UTF-8"})
     if ttl is not None: e["CC_SL_STATE_TTL"] = str(ttl)
     if env: e.update(env)
-    stdin = json.dumps({"session_id": sid, "prompt_id": pid,
-                        "model": {"display_name": "T"}, "workspace": {"current_dir": "/tmp"},
-                        "cost": {"total_cost_usd": cost}})
+    body = {"session_id": sid, "prompt_id": pid,
+            "model": {"display_name": "T"}, "workspace": {"current_dir": "/tmp"},
+            "cost": {"total_cost_usd": cost}}
+    if tr:
+        body["transcript_path"] = tr
+    stdin = json.dumps(body)
     p = subprocess.run([sys.executable, SCRIPT], input=stdin, capture_output=True,
                        text=True, env=e)
     out = re.sub(r"\x1b\[[0-9;]*m", "", p.stdout)
@@ -151,6 +154,114 @@ rc, delta, out = run(d, "S", "P", 5.0)
 check("corrupt DB: exit 0", rc, 0)
 check("corrupt DB: parens hidden only", delta, None)
 check("corrupt DB: cost total survives", "$5.00" in out, True)
+
+print("\n[11] per-agent cost attribution")
+AT = os.path.join(BASE, "att.jsonl")
+ASUB = os.path.join(BASE, "att", "subagents")
+TS = "2026-08-20T20:00:00.000Z"
+
+
+def write_parent(*extra):
+    with open(AT, "w") as f:
+        f.write(json.dumps({"type": "user", "promptId": "P1",
+                            "message": {"role": "user", "content": "x"}}) + "\n")
+        for e in extra:
+            f.write(json.dumps(e) + "\n")
+
+
+def asst(model, cw, out, mid):
+    return {"type": "assistant", "isSidechain": True, "timestamp": TS,
+            "message": {"role": "assistant", "model": model, "id": mid,
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 1, "cache_creation_input_tokens": cw,
+                                  "cache_read_input_tokens": 0, "output_tokens": out}}}
+
+
+def write_agent(aid, entries, name="A"):
+    os.makedirs(ASUB, exist_ok=True)
+    with open(os.path.join(ASUB, "agent-%s.jsonl" % aid), "w") as f:
+        f.write(json.dumps({"type": "user", "isSidechain": True, "promptId": "P1",
+                            "agentId": aid, "timestamp": TS,
+                            "message": {"role": "user", "content": "x"}}) + "\n")
+        for e in entries:
+            f.write(json.dumps(dict(e, agentId=aid)) + "\n")
+    with open(os.path.join(ASUB, "agent-%s.meta.json" % aid), "w") as f:
+        json.dump({"agentType": "general-purpose", "description": name,
+                   "spawnDepth": 1}, f)
+
+
+def agent_rows(db):
+    c = sqlite3.connect(db)
+    r = dict((x[0], x[1]) for x in
+             c.execute("SELECT agent_id, cost FROM agent"))
+    c.close()
+    return r
+
+
+def rates(db):
+    c = sqlite3.connect(db)
+    r = dict((x[0], x[1] / x[2]) for x in
+             c.execute("SELECT model, usd, w FROM model_rate") if x[2] > 0)
+    c.close()
+    return r
+
+
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+write_parent()
+d = db("att1")
+write_agent("X", [asst("fable", 1000, 100, "x1")])
+run(d, "S", "P1", 1.00, tr=AT)                      # first sight: baselines
+write_agent("X", [asst("fable", 1000, 100, "x1"), asst("fable", 5000, 900, "x2")])
+run(d, "S", "P1", 3.00, tr=AT)                      # +$2.00, only X moved
+ar = agent_rows(d)
+check("solo agent takes the whole interval", round(ar.get("X", 0), 4), 2.0)
+check("solo interval calibrates that model", "fable" in rates(d), True)
+
+# a second agent appears; both grow in the same interval
+write_agent("Y", [asst("haiku", 1000, 100, "y1")])
+run(d, "S", "P1", 3.00, tr=AT)                      # establish Y's baseline, no spend
+write_agent("X", [asst("fable", 1000, 100, "x1"), asst("fable", 5000, 900, "x2"),
+                  asst("fable", 4000, 800, "x3")])
+write_agent("Y", [asst("haiku", 1000, 100, "y1"), asst("haiku", 4000, 800, "y2")])
+run(d, "S", "P1", 4.00, tr=AT)                      # +$1.00 split two ways
+ar = agent_rows(d)
+check("concurrent agents both accrue", (ar["X"] > 2.0, ar["Y"] > 0.0), (True, True))
+c = sqlite3.connect(d)
+tot = c.execute("SELECT SUM(cost) FROM agent").fetchone()[0]
+turn = c.execute("SELECT cost_last - cost_start FROM turn").fetchone()[0]
+c.close()
+check("parts reconcile with the turn delta", round(tot, 6), round(turn, 6))
+
+# money arriving before the transcript catches up is banked, never lost
+run(d, "S", "P1", 4.75, tr=AT)                      # +$0.75, nobody moved
+c = sqlite3.connect(d)
+tot = c.execute("SELECT SUM(cost) FROM agent").fetchone()[0]
+turn = c.execute("SELECT cost_last - cost_start FROM turn").fetchone()[0]
+parent = c.execute("SELECT cost FROM agent WHERE agent_id=''").fetchone()[0]
+c.close()
+check("unattributable spend goes to the parent", round(parent, 4) >= 0.75, True)
+check("still reconciles after a lagging interval", round(tot, 6), round(turn, 6))
+
+# a fresh session's agent starts from zero
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+write_parent()
+d2 = db("att2")
+write_agent("Z", [asst("fable", 1000, 100, "z1")])
+run(d2, "S2", "P1", 0.10, tr=AT)
+check("new agent starts at 0", round(agent_rows(d2).get("Z", -1), 4), 0.0)
+
+# calibration must ignore contaminated intervals
+d3 = db("att3")
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+write_parent()
+write_agent("A", [asst("m1", 1000, 100, "a1")])
+write_agent("B", [asst("m2", 1000, 100, "b1")])
+run(d3, "S3", "P1", 1.00, tr=AT)
+write_agent("A", [asst("m1", 1000, 100, "a1"), asst("m1", 9000, 900, "a2")])
+write_agent("B", [asst("m2", 1000, 100, "b1"), asst("m2", 9000, 900, "b2")])
+run(d3, "S3", "P1", 2.00, tr=AT)
+check("two movers calibrate nothing", rates(d3), {})
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
 
 print("\n%s  (%d pass, %d fail)" % ("ALL PASS" if not FAIL else "FAILURES", OK, FAIL))
 sys.exit(1 if FAIL else 0)
