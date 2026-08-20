@@ -75,6 +75,13 @@ Env knobs:
                      (default 604800). Only whole quiet sessions expire, and
                      never the running one.
   CC_SL_STATE_DB     override the state file (default ~/.claude/statusline-state.db)
+  CC_SL_RATE_FLOOR   weighted tokens a model must have behind it before its own
+                     learned rate is trusted for a concurrent split (default
+                     500000). Below it the pooled rate is used instead -- a thin
+                     sample is worse than no sample.
+  CC_SL_RATE_OUTLIER reject an interval whose implied price is off the
+                     established rate by more than this factor (default 5,
+                     0 disables). Only applies once the floor is cleared.
   CC_SL_SCAN_CAP     bytes of transcript the turn scan may walk (default 4M)
   CC_SL_NO_STATE=1   skip SQLite entirely; drops the $ delta, keeps ↓/⇧
   CC_SL_NO_AGENTS=1  drop the per-subagent rows; output returns to three lines
@@ -328,6 +335,8 @@ AGENT_CTX = int(num(E("CC_SL_AGENT_CTX"), 200000))
 # stiffer with every sample and would sit on a stale price forever; decaying
 # the old evidence lets a repricing wash through in a few weeks.
 RATE_HALFLIFE = int(num(E("CC_SL_RATE_HALFLIFE"), 14 * 86400))
+RATE_FLOOR = float(num(E("CC_SL_RATE_FLOOR"), 500000))
+RATE_OUTLIER = float(num(E("CC_SL_RATE_OUTLIER"), 5))
 CK = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 SEP = f" {DIM}│{R} "
@@ -738,9 +747,18 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
     two movers is contaminated and is never used for calibration.
 
     Concurrent movers split the interval by weighted growth, priced with the
-    rates learned so far. An uncalibrated model falls back to the mean of the
-    known rates rather than a bare 1.0, which would otherwise dwarf real rates
-    (dollars per token are ~1e-6) and hand it the whole interval.
+    rates learned so far. A rate is a decay-weighted ratio of sums -- Σusd / Σw
+    over every solo interval -- which volume-weights the observations, so a tiny
+    interval with a chunk of money attached cannot vote as loudly as a large
+    clean one. `n` records the effective sample count behind it.
+
+    Two guards keep a noisy estimate from steering a split. A model must have
+    RATE_FLOOR weighted tokens behind it before its own rate is used; below that
+    the pooled rate across all models stands in, because a thin sample is worse
+    than no sample. And once a rate clears the floor, an interval whose implied
+    price is off it by more than RATE_OUTLIER is dropped rather than folded in.
+    With nothing measured at all every model prices at 1.0, which reduces the
+    split to unweighted structural tokens.
 
     The parent rides along as agent_id "" so the parts always sum to the turn.
     """
@@ -764,25 +782,49 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
             # also carries money banked from unattributable intervals, and the
             # sample would price the parent's model with an agent's spend.
             if mdl and dw > 0 and (aid or not agents):
-                r = con.execute("SELECT w, usd, updated_at FROM model_rate "
+                r = con.execute("SELECT w, usd, n, updated_at FROM model_rate "
                                 "WHERE model=?", (mdl,)).fetchone()
-                w0 = u0 = 0.0
+                w0 = u0 = n0 = 0.0
                 if r:
                     # Age the stored evidence before adding to it. Without this
                     # the rate is a lifetime mean: a price change two months in
                     # would be outvoted by every sample that came before it and
-                    # would never be learned.
-                    age = max(0, NOW - int(num(r[2])))
+                    # would never be learned. n decays with it, so it reads as
+                    # an EFFECTIVE sample count rather than a lifetime tally.
+                    age = max(0, NOW - int(num(r[3])))
                     k = (0.5 ** (float(age) / RATE_HALFLIFE)) if RATE_HALFLIFE > 0 else 0.0
-                    w0, u0 = float(r[0]) * k, float(r[1]) * k
-                con.execute("INSERT OR REPLACE INTO model_rate VALUES (?,?,?,?)",
-                            (mdl, w0 + dw, u0 + spent, NOW))
+                    w0, u0, n0 = (float(r[0]) * k, float(r[1]) * k,
+                                  float(num(r[2])) * k)
+                # Once a rate stands on real evidence, refuse an interval whose
+                # implied price is wildly off it. Money banked from a lagging
+                # interval, or a split that guessed, otherwise folds in
+                # permanently -- and it distorts a thin model far more than a
+                # thick one, which is how two models an order of magnitude apart
+                # in price ended up 1.4x apart in their learned rates.
+                rate0 = (u0 / w0) if (w0 > 0 and u0 > 0) else 0.0
+                implied = spent / dw
+                if (rate0 <= 0 or w0 < RATE_FLOOR or RATE_OUTLIER <= 0
+                        or rate0 / RATE_OUTLIER <= implied <= rate0 * RATE_OUTLIER):
+                    con.execute(
+                        "INSERT OR REPLACE INTO model_rate "
+                        "(model, w, usd, n, updated_at) VALUES (?,?,?,?,?)",
+                        (mdl, w0 + dw, u0 + spent, n0 + 1.0, NOW))
         elif len(grew) > 1:
-            known = {}
+            known, pool_w, pool_u = {}, 0.0, 0.0
             for m_, w_, u_ in con.execute("SELECT model, w, usd FROM model_rate"):
-                if float(w_) > 0:
-                    known[m_] = float(u_) / float(w_)
-            dflt = (sum(known.values()) / len(known)) if known else 1.0
+                w_, u_ = float(w_), float(u_)
+                if w_ <= 0 or u_ <= 0:
+                    continue
+                pool_w, pool_u = pool_w + w_, pool_u + u_
+                if w_ >= RATE_FLOOR:
+                    known[m_] = u_ / w_
+            # A thin sample is worse than no sample. A fixed chunk of
+            # misattributed money barely moves a model with millions of weighted
+            # tokens behind it and badly distorts one with a hundred thousand, so
+            # below the floor use the pooled rate over everything measured so
+            # far. With nothing measured at all, 1.0 for everyone reduces the
+            # split to unweighted structural tokens -- the documented fallback.
+            dflt = (pool_u / pool_w) if pool_w > 0 else 1.0
             wts = [(aid, dw * known.get(mdl, dflt)) for aid, mdl, _w, dw in grew]
             tot = sum(x[1] for x in wts)
             for aid, x in wts:
@@ -855,7 +897,15 @@ def cost_delta(sid, pid, cost_now, agents=(), parent_w=0.0, main_model=""):
                          model      TEXT PRIMARY KEY,
                          w          REAL NOT NULL,
                          usd        REAL NOT NULL,
+                         n          REAL NOT NULL DEFAULT 0,
                          updated_at INTEGER NOT NULL)""")
+        try:
+            # Tables written before n existed. Cheap enough to retry each
+            # redraw; it throws once the column exists, and the throw is caught.
+            con.execute("ALTER TABLE model_rate ADD COLUMN n REAL NOT NULL "
+                        "DEFAULT 0")
+        except Exception:
+            pass
         row = con.execute("SELECT cost_start, cost_last FROM turn "
                           "WHERE session_id=? AND prompt_id=?", (sid, pid)).fetchone()
         if row is None:

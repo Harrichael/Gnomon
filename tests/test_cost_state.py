@@ -384,5 +384,89 @@ check("the parent still takes the interval it earned",
       round(agent_rows(d).get("", 0.0) - before, 4), 1.00)
 shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
 
+print("\n[15] a thin or wild sample must not steer a split")
+
+
+def n_of(db, model):
+    c = sqlite3.connect(db)
+    r = c.execute("SELECT n FROM model_rate WHERE model=?", (model,)).fetchone()
+    c.close()
+    return r[0] if r else None
+
+
+def calib(db, sid, pid, model, up, spend, env=None):
+    """One clean solo-mover interval for `model`. w = 1.25 * (up + 12)."""
+    shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+    write_parent(pid=pid)
+    seed = asst(model, 10, 0, pid + "s")
+    write_agent("C", [seed], pid=pid)
+    run(db, sid, pid, 0.01, tr=AT, env=env)             # first sight, spent 0
+    write_agent("C", [seed, asst(model, up, 0, pid + "g")], pid=pid)
+    run(db, sid, pid, 0.01 + spend, tr=AT, env=env)     # only C moved
+
+
+# n is an EFFECTIVE sample count -- it decays with the evidence, so a rate built
+# from 400 observations is distinguishable from one built from 2. Without it the
+# table cannot say which of its rows is trustworthy.
+d = db("n1")
+calib(d, "N", "P1", "mm", 100000, 1.00)
+check("one interval -> n = 1", round(n_of(d, "mm"), 1), 1.0)
+calib(d, "N", "P2", "mm", 100000, 1.00)
+check("two intervals -> n = 2", round(n_of(d, "mm"), 1), 2.0)
+
+# above the floor, an interval whose implied price is absurd is dropped whole
+d = db("out1")
+calib(d, "O", "P1", "mm", 800000, 1.00)             # w = 1.0M, clears the floor
+r1 = rate_of(d, "mm")
+calib(d, "O", "P2", "mm", 800000, 100.00)           # implied 100x
+check("a 100x interval is refused outright", rate_of(d, "mm"), r1)
+check("and never counts toward n", round(n_of(d, "mm"), 1), 1.0)
+
+# but a genuine repricing is inside the guard and must still land
+d = db("out2")
+calib(d, "R", "P1", "mm", 800000, 1.00)
+calib(d, "R", "P2", "mm", 800000, 3.00)             # 3x < RATE_OUTLIER
+check("a 3x repricing is accepted", round(n_of(d, "mm"), 1), 2.0)
+check("and moves the rate", rate_of(d, "mm") > rate_of(db("out1"), "mm"), True)
+
+# below the floor there is nothing to judge against, so everything is taken
+d = db("out3")
+calib(d, "T", "P1", "mm", 100000, 1.00)             # w = 125K, under the floor
+calib(d, "T", "P2", "mm", 100000, 100.00)
+check("under the floor a wild interval is still taken",
+      round(n_of(d, "mm"), 1), 2.0)
+
+# the floor in action: a thin high rate must not price a concurrent split
+d = db("floor")
+calib(d, "F", "C1", "thin", 100000, 5.00)           # w = 125K, ~$40/1M
+calib(d, "F", "C2", "thick", 800000, 1.00)          # w = 1.0M, ~$1/1M
+
+
+def split(db, sid, env=None):
+    """One concurrent interval, both agents growing by exactly the same weight."""
+    shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+    write_parent(pid="X1")
+    sa, sb = asst("thin", 10, 0, "as"), asst("thick", 10, 0, "bs")
+    write_agent("A", [sa], pid="X1")
+    write_agent("B", [sb], pid="X1")
+    run(db, sid, "X1", 10.00, tr=AT, env=env)       # first sight, spent 0
+    write_agent("A", [sa, asst("thin", 50000, 0, "ag")], pid="X1")
+    write_agent("B", [sb, asst("thick", 50000, 0, "bg")], pid="X1")
+    run(db, sid, "X1", 11.00, tr=AT, env=env)       # +$1.00 to divide
+    return agent_rows(db)
+
+
+ar = split(d, "F2")
+# thin is below the floor so it prices at the pooled rate ($6.00 / 1.125M),
+# thick at its own ($1.00 / 1.0M) -- about 5.3x apart, not 40x
+check("thin agent priced off the pool, not its own thin rate",
+      0.78 < ar["A"] < 0.88, True)
+check("the interval still reconciles", round(ar["A"] + ar["B"], 4), 1.0)
+
+# same DB, same evidence -- only the floor differs
+ar0 = split(d, "F3", env={"CC_SL_RATE_FLOOR": "0"})
+check("with the floor off, the thin rate dominates instead", ar0["A"] > 0.95, True)
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+
 print("\n%s  (%d pass, %d fail)" % ("ALL PASS" if not FAIL else "FAILURES", OK, FAIL))
 sys.exit(1 if FAIL else 0)

@@ -155,6 +155,26 @@ the curve rather than on whichever anchor got hardcoded:
 Percentages hold flat below the small anchor — extrapolating downward would make
 a 100K window 96% green.
 
+**A thin learned rate is worse than no learned rate.** `model_rate` is a
+decay-weighted ratio of sums — `Σusd / Σw` over every solo-mover interval, which
+volume-weights the observations so a tiny interval with a chunk of money attached
+cannot vote as loudly as a large clean one. But a fixed piece of misattributed
+money barely moves a model with millions of weighted tokens behind it and badly
+distorts one with a hundred thousand: two models an order of magnitude apart in
+list price ended up 1.4× apart in their learned rates, compressed toward each
+other, which is the signature of a constant additive error. Three guards:
+
+- `n` — an effective sample count, decayed with the evidence, so the table can
+  say which of its rows is trustworthy. Nothing reads it yet; it exists so the
+  question is answerable.
+- `CC_SL_RATE_FLOOR` (500K weighted tokens) — below it a model prices at the
+  pooled rate across all models rather than its own.
+- `CC_SL_RATE_OUTLIER` (5×) — once above the floor, an interval whose implied
+  price is off the established rate by more than this is dropped whole. A
+  genuine repricing is well inside 5×, so it still lands.
+
+Below the floor everything is accepted: there is nothing yet to judge against.
+
 **An unknown cost baseline is not zero.** `total_cost_usd` accumulates per
 *process*, so treating a missing baseline as 0 bills one turn for the whole
 session. Anchor on the live reading instead.
