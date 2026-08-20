@@ -447,6 +447,41 @@ check("COLUMNS=0 disables shedding entirely",
       ANSI.sub("", rows(o)[0]).endswith("description ✓"), True)
 wipe()
 
+print("\n[7d] context-bar bands scale with the window size")
+
+# 60/80 answers "how close to compaction?" -- right on 200K, useless on 1M where
+# 60% is 600K. The band edges are absolute token counts interpolated log-log
+# between the two anchors, so an in-between or future window lands sensibly.
+GRN, AMB, RD = "38;5;114", "38;5;214", "31"
+
+
+def bar_color(size, pct):
+    d = payload("AAA", 1000)
+    d["context_window"] = {"used_percentage": pct, "context_window_size": size,
+                           "total_input_tokens": int(size * pct / 100)}
+    run(d, env={"CC_SL_NO_STATE": "1"})
+    m = re.search(r"\033\[([0-9;]+)m[█░]+ +[0-9]+%", RAW[-1])
+    return m.group(1) if m else None
+
+
+for size, pct, want, why in [
+        (200000,  23, GRN, "200K at 23% stays green"),
+        (200000,  65, AMB, "200K at 65% is amber"),
+        (200000,  85, RD,  "200K at 85% is red"),
+        (1000000, 15, GRN, "1M under 200K resident is green"),
+        (1000000, 23, AMB, "1M at 23% (232K) is amber, not green"),
+        (1000000, 55, RD,  "1M past 500K resident is red"),
+        (400000,  30, GRN, "400K interpolates: 30% still green"),
+        (400000,  50, AMB, "400K interpolates: 50% is amber"),
+        (2000000, 10, GRN, "2M at 10% (200K) is green"),
+        (2000000, 45, RD,  "2M past 817K is red"),
+        (100000,  65, AMB, "small windows hold the flat 60/80 bands")]:
+    check(why, bar_color(size, pct), want)
+
+# continuity: the curve must not jump at the anchors
+check("no discontinuity below the 200K anchor",
+      bar_color(199000, 59), bar_color(200000, 59))
+
 print("\n[8] timing")
 pl = json.dumps(payload("CCC", 5000))
 e = dict(os.environ, HOME=HOME, COLUMNS="200", CC_SL_NO_API="1", CC_SL_NO_GIT="1", CC_SL_NO_K8S="1", TMPDIR=T)

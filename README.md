@@ -132,6 +132,23 @@ in the turn its row also carries money banked from unattributable intervals, so
 the sample would price the main model with an agent's spend. Agent-free turns are
 the majority, so the main model still calibrates quickly.
 
+**A context-bar threshold is a token count, not a percentage.** 60/80 answers
+"how close am I to compaction?", which is the right question on a 200K window and
+a useless one on 1M — 60% there is 600K, so the bar sits green through an entire
+session. What matters on a big window is what every turn costs, and those lines
+are absolute: 200K resident and 500K. Two anchors (200K → 60/80, 1M → 20/50) with
+the *edges* interpolated log-log, so an in-between or future window size lands on
+the curve rather than on whichever anchor got hardcoded:
+
+```
+   200K   green <60%  amber <80%      1M   green <20%  amber <50%
+   400K   green <37%  amber <65%      2M   green <12%  amber <41%
+   500K   green <32%  amber <61%     10M   green < 4%  amber <26%
+```
+
+Percentages hold flat below the small anchor — extrapolating downward would make
+a 100K window 96% green.
+
 **An unknown cost baseline is not zero.** `total_cost_usd` accumulates per
 *process*, so treating a missing baseline as 0 bills one turn for the whole
 session. Anchor on the live reading instead.

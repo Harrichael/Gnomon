@@ -91,6 +91,7 @@ Env knobs:
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -238,10 +239,9 @@ R = "\033[0m"
 B = "\033[1m"
 DIM = "\033[2;37m"
 BLUE = "\033[94m"
-YELLOW = "\033[33m"
 RED = "\033[31m"
 GREEN = "\033[38;5;114m"    # bar under 60%, +lines, agent done
-AMBER = "\033[38;5;214m"       # pace warning on line 3
+AMBER = "\033[38;5;214m"       # context bar mid band, pace warning
 ORANGE = "\033[38;5;173m"      # model
 EFFORTC = "\033[38;5;179m"     # [effort]
 CYAN = "\033[1;36m"            # cwd
@@ -266,6 +266,43 @@ REDLINE = int(num(E("CC_SL_REDLINE"), 85))    # used% that is red regardless of 
 PACE_BLUE = int(num(E("CC_SL_PACE_BLUE"), -20))
 PACE_AMBER = int(num(E("CC_SL_PACE_AMBER"), -5))
 PACE_RED = int(num(E("CC_SL_PACE_RED"), 10))
+
+# Context-bar bands. The colour has to answer a question that changes with the
+# window size. On 200K it is "how close am I to compaction?" -- hence 60/80. On
+# 1M that reading is useless: 60% is 600K, which a session realistically never
+# reaches, so the bar sits green forever. What matters on a big window is "how
+# much does every turn cost now?", and the honest lines there are absolute:
+# 200K (one standard window resident) and 500K.
+#
+# Anchor both readings and interpolate between them, so a model shipping 400K or
+# 2M lands somewhere sensible instead of on whichever anchor was hardcoded.
+CTX_A = (200000, 0.60, 0.80)      # 200K: green <120K, amber <160K
+CTX_B = (1000000, 0.20, 0.50)     # 1M:   green <200K, amber <500K
+
+
+def ctx_bands(size):
+    """(green_below, amber_below), as percentages of a `size`-token window.
+
+    Interpolated log-log on the ABSOLUTE edges, not on the percentages: the
+    band edges are token counts that grow sub-linearly with the window, which is
+    exactly what lets 200K and 1M both read correctly off one curve. Below the
+    small anchor the percentages hold flat — extrapolating downward would turn a
+    100K window 96% green, which is the opposite of the point.
+
+        200K -> 60% / 80%        500K -> 32% / 61%
+        400K -> 37% / 67%          1M -> 20% / 50%
+                                   2M -> 12% / 41%
+    """
+    s = int(num(size, CTX_A[0])) or CTX_A[0]
+    if s <= CTX_A[0]:
+        return CTX_A[1] * 100.0, CTX_A[2] * 100.0
+    x = math.log(float(s) / CTX_A[0]) / math.log(float(CTX_B[0]) / CTX_A[0])
+    edge = []
+    for i in (1, 2):
+        a, b = CTX_A[0] * CTX_A[i], CTX_B[0] * CTX_B[i]
+        edge.append(a * (b / a) ** x * 100.0 / s)
+    return edge[0], edge[1]
+
 
 STATE_DB = os.path.expanduser(E("CC_SL_STATE_DB")
                               or "~/.claude/statusline-state.db")
@@ -883,7 +920,8 @@ if ctx_pct_raw is not None:
     size = int(num(dig("context_window", "context_window_size"), 200000))
     filled = min(10, (pct + 5) // 10)
     bar = "█" * filled + "░" * (10 - filled)
-    cc = GREEN if pct < 60 else (YELLOW if pct <= 80 else RED)
+    lo, hi = ctx_bands(size)
+    cc = GREEN if pct < lo else (AMBER if pct <= hi else RED)
     warn = f" {RED}{B}⚠{R}" if dig("exceeds_200k_tokens", default=False) else ""
     bar_txt = f"⛁ {cc}{bar} {pct}%{R} {DIM}of{R} {ORANGE}{fmt_size(size)}{R}{warn}"
 
@@ -1197,7 +1235,8 @@ def agent_bar(ctx, win):
     """Six cells against an inferred window, coloured like line 2's bar."""
     pct = 0 if win <= 0 else max(0, min(100, int(round(ctx * 100.0 / win))))
     filled = min(6, (pct * 6 + 50) // 100)
-    col = GREEN if pct < 60 else (YELLOW if pct <= 80 else RED)
+    lo, hi = ctx_bands(win)
+    col = GREEN if pct < lo else (AMBER if pct <= hi else RED)
     return f"{col}{'█' * filled}{'░' * (6 - filled)} {pct:>3d}%{R}"
 
 
