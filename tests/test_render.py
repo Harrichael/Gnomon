@@ -482,6 +482,33 @@ for size, pct, want, why in [
 check("no discontinuity below the 200K anchor",
       bar_color(199000, 59), bar_color(200000, 59))
 
+print("\n[7e] line-1 markers")
+
+def line1(env=None, cwd=None, nogit="1"):
+    d = payload("AAA", 1000)
+    d["workspace"] = {"current_dir": cwd or "/tmp"}
+    e = {"CC_SL_NO_STATE": "1", "CC_SL_NO_GIT": nogit}
+    e.update(env or {})
+    return run(d, env=e)[1].split("\n")[0]
+
+check("folder marker precedes the cwd", "⌂ /tmp" in line1(), True)
+check("empty CC_SL_DIR_ICON drops it, no stray space",
+      line1(env={"CC_SL_DIR_ICON": ""}).endswith(" /tmp"), True)
+check("marker is overridable", "📁 /tmp" in line1(env={"CC_SL_DIR_ICON": "📁"}), True)
+
+GT = os.path.join(T, "gitrepo")
+shutil.rmtree(GT, ignore_errors=True); os.makedirs(GT)
+g = subprocess.run(["git", "init", "-q", "-b", "trunk", GT], capture_output=True)
+if g.returncode == 0:
+    out = line1(cwd=GT, nogit="")
+    check("branch marker precedes the branch", "⎇ trunk" in out, True)
+    check("empty CC_SL_GIT_ICON drops it",
+          "trunk" in line1(cwd=GT, nogit="", env={"CC_SL_GIT_ICON": ""})
+          and "⎇" not in line1(cwd=GT, nogit="", env={"CC_SL_GIT_ICON": ""}), True)
+    shutil.rmtree(GT, ignore_errors=True)
+else:
+    print("  SKIP  git unavailable")
+
 print("\n[8] timing")
 pl = json.dumps(payload("CCC", 5000))
 e = dict(os.environ, HOME=HOME, COLUMNS="200", CC_SL_NO_API="1", CC_SL_NO_GIT="1", CC_SL_NO_K8S="1", TMPDIR=T)

@@ -58,6 +58,8 @@ work lands in ⇧ for the turn that asked for it.
 
 Env knobs:
   CC_SL_FULL CC_SL_Q1 CC_SL_HALF CC_SL_Q3 CC_SL_EMPTY   dot glyphs
+  CC_SL_DIR_ICON CC_SL_GIT_ICON   line-1 markers (default ⌂ and ⎇).
+                     Set to "" to drop one, or to a Nerd Font glyph.
   CC_SL_REDLINE      used% that is red on the clock alone (default 85)
   CC_SL_PACE_BLUE    delta below which you're underusing (default -20)
   CC_SL_PACE_AMBER   delta at which warm starts (default -5)
@@ -259,6 +261,13 @@ Q1 = E("CC_SL_Q1", "◔")
 HALF = E("CC_SL_HALF", "◑")
 Q3 = E("CC_SL_Q3", "◕")
 EMPTY = E("CC_SL_EMPTY", "○")
+# Line-1 markers. U+2387 is the neighbour of the ⎈ already used for the k8s
+# segment, so a terminal that renders one renders the other; U+2302 sits in a
+# block with the same broad coverage. Both single-width, both overridable --
+# vlen() counts codepoints, not display cells, so a double-width emoji here
+# would undercount (harmless on line 1, which is never shed).
+DIR_ICON = E("CC_SL_DIR_ICON", "⌂")
+GIT_ICON = E("CC_SL_GIT_ICON", "⎇")
 REDLINE = int(num(E("CC_SL_REDLINE"), 85))    # used% that is red regardless of clock
 # Pace band edges, in percentage points of (used% - elapsed%). Below BLUE you
 # are leaving capacity unused; BLUE..AMBER is the sweet spot; AMBER..RED is
@@ -370,7 +379,8 @@ parts1 = [f"{ORANGE}{model}{R}"]
 if effort:
     parts1.append(f"{EFFORTC}[{effort}]{R}")
 if cwd_disp:
-    parts1.append(f"{CYAN}{cwd_disp}{R}")
+    parts1.append(f"{CYAN}{DIR_ICON} {cwd_disp}{R}" if DIR_ICON
+                  else f"{CYAN}{cwd_disp}{R}")
 
 if not E("CC_SL_NO_K8S"):
     def _k8s():
@@ -399,7 +409,7 @@ if not E("CC_SL_NO_GIT") and cwd:
 
     branch, changes = cached("git:" + cwd, 5, _git)
     if branch:
-        seg = f"{GITC}{branch}{R}"
+        seg = f"{GITC}{GIT_ICON} {branch}{R}" if GIT_ICON else f"{GITC}{branch}{R}"
         if changes:
             seg += f" {GITN}(+{changes}){R}"
         parts1.append(seg)

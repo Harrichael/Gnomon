@@ -21,6 +21,12 @@ layout, install, and the invariants that are easy to break by accident.
     tests/fixtures/          a captured real stdin payload
     archive/                 pre-feature snapshot, kept from before git existed
 
+Line 1 marks the working directory with `⌂` and the git branch with `⎇`, both
+overridable via `CC_SL_DIR_ICON` / `CC_SL_GIT_ICON` (set either to `""` to drop
+it, or to a Nerd Font glyph if your terminal has one). U+2387 is the immediate
+neighbour of the `⎈` already used for the kubernetes segment, so any terminal
+rendering one renders the other.
+
 ## Install
 
     ./statusline/install.sh
