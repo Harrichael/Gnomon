@@ -731,6 +731,52 @@ def clamp_base(base, cost_now):
     return cost_now if base > cost_now else base
 
 
+# ── OPEN: the learned rates are compressed toward each other ─────────────────
+# Unresolved as of 2026-08-20. RATE_FLOOR and RATE_OUTLIER below contain the
+# damage; neither explains it. Picking this up later starts here.
+#
+# weigh() is an input-token-equivalent — 1.25x cache write, 0.1x cache read, 5x
+# output, all relative to input = 1 — so a correctly calibrated usd/w should land
+# near a model's INPUT price. Measured on this machine after ~2h of real use:
+#
+#     claude-opus-5                w=2,314,858   $10.37    $4.48 / 1M
+#     claude-fable-5               w=  175,808    $1.90   $10.79 / 1M
+#     claude-haiku-4-5-20251001    w=  117,562    $0.37    $3.14 / 1M
+#
+# Opus reads implausibly low for its tier and Haiku implausibly high; the learned
+# Opus:Haiku ratio is 1.4:1 where the real spread is several times that. Both
+# estimates sit pulled toward one another, which is the signature of a CONSTANT
+# ADDITIVE error — money that is not proportional to the tokens being measured,
+# spread across whoever happened to move. A fixed misattributed chunk barely
+# dents a model with millions of weighted tokens behind it and dominates one with
+# a hundred thousand, which is exactly the asymmetry the table shows.
+#
+# Where to look, in order:
+#   1. Re-measure first. Two of those three samples predate the w_last fix (only
+#      advance on a paid interval), which was itself an alignment bug between
+#      growth and spend. The remaining skew may be smaller than it looks here.
+#   2. `share[""] = spent` on a no-mover interval banks money on the parent. That
+#      is right for reconciliation and wrong for calibration: the growth that
+#      earned it was in a different interval, so a later solo interval can carry
+#      dw without its matching spend, biasing that rate DOWN.
+#   3. weigh()'s coefficients are one fixed shape for every model. If a model's
+#      actual price shape differs, usd/w absorbs the mismatch into a scalar and
+#      the rate becomes workload-dependent — an agent doing mostly output prices
+#      differently from one doing mostly cache reads. A per-model least-squares
+#      fit over (up, cr, out) is the principled answer and is probably
+#      ill-conditioned in practice: those three grow near-proportionally in real
+#      traffic, so the design matrix is close to rank-deficient. Ridge-regularise
+#      toward the current fixed shape if it is attempted at all.
+#
+# Cheapest next step: under an env flag, append every calibration sample
+# (model, dw, spent, n_movers) to a debug table and look at the scatter. The
+# hypothesis above is inferred from three aggregates; it deserves raw points
+# before anyone writes code against it.
+#
+# Bounded, in the meantime: rates only ever divide an interval BETWEEN
+# concurrent participants. Every solo interval is measured money, and the turn
+# total on line 2 does not depend on any of this.
+# ─────────────────────────────────────────────────────────────────────────────
 def attribute(con, sid, pid, spent, agents, parent_w, main_model):
     """Split the money spent since the last redraw across whoever did work.
 

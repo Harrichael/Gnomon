@@ -220,3 +220,15 @@ SL_SCRIPT=/tmp/mut.py python3 tests/test_render.py   # must report exactly 2 fai
   every turn (~250 B each). Age no longer bounds the table.
 - **A forward clock jump** pins a row as the permanent "most recent" and keeps
   its session from expiring.
+- **The learned rates are compressed toward each other — root cause unresolved.**
+  `weigh()` is an input-token-equivalent, so `usd/w` should land near a model's
+  input price. Measured after ~2h of real use, Opus read $4.48/1M and Haiku
+  $3.14/1M — a 1.4× spread where the real one is several times that, both pulled
+  toward the middle. That is what a constant additive error looks like when it
+  lands on samples of very different sizes. `CC_SL_RATE_FLOOR` and
+  `CC_SL_RATE_OUTLIER` contain the damage; neither explains it. The full note,
+  with the three places to look and the suggested next step (log raw calibration
+  samples under a flag and look at the scatter before theorising further), is the
+  block comment above `attribute()`. Bounded meanwhile: rates only divide an
+  interval between concurrent participants — every solo interval is measured
+  money, and line 2's total never depends on them.
