@@ -81,6 +81,9 @@ Env knobs:
                      (default 300; 0 disables the reap)
   CC_SL_AGENT_CTX    context-window denominator for an agent whose window can't
                      be inferred (default 200000)
+  CC_SL_RATE_HALFLIFE  seconds after which learned per-model price evidence is
+                     worth half as much (default 14 days; 0 = keep only the
+                     newest sample)
   CC_SL_NO_K8S=1     skip the kubectl probe
   CC_SL_NO_GIT=1     skip the git probe
 """
@@ -275,6 +278,10 @@ SCAN_CAP = int(num(E("CC_SL_SCAN_CAP"), 4 << 20))
 AGENT_STALE = int(num(E("CC_SL_AGENT_STALE"), 300))
 AGENT_MAX = int(num(E("CC_SL_AGENT_MAX"), 6))
 AGENT_CTX = int(num(E("CC_SL_AGENT_CTX"), 200000))
+# Half-life of learned per-model price evidence. A lifetime average gets
+# stiffer with every sample and would sit on a stale price forever; decaying
+# the old evidence lets a repricing wash through in a few weeks.
+RATE_HALFLIFE = int(num(E("CC_SL_RATE_HALFLIFE"), 14 * 86400))
 CK = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 SEP = f" {DIM}│{R} "
@@ -706,10 +713,19 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
             aid, mdl, _w, dw = grew[0]
             share[aid] = spent
             if aid and mdl and dw > 0:
-                con.execute("INSERT INTO model_rate VALUES (?,?,?,?) "
-                            "ON CONFLICT(model) DO UPDATE SET w=w+excluded.w, "
-                            "usd=usd+excluded.usd, updated_at=excluded.updated_at",
-                            (mdl, dw, spent, NOW))
+                r = con.execute("SELECT w, usd, updated_at FROM model_rate "
+                                "WHERE model=?", (mdl,)).fetchone()
+                w0 = u0 = 0.0
+                if r:
+                    # Age the stored evidence before adding to it. Without this
+                    # the rate is a lifetime mean: a price change two months in
+                    # would be outvoted by every sample that came before it and
+                    # would never be learned.
+                    age = max(0, NOW - int(num(r[2])))
+                    k = (0.5 ** (float(age) / RATE_HALFLIFE)) if RATE_HALFLIFE > 0 else 0.0
+                    w0, u0 = float(r[0]) * k, float(r[1]) * k
+                con.execute("INSERT OR REPLACE INTO model_rate VALUES (?,?,?,?)",
+                            (mdl, w0 + dw, u0 + spent, NOW))
         elif len(grew) > 1:
             known = {}
             for m_, w_, u_ in con.execute("SELECT model, w, usd FROM model_rate"):

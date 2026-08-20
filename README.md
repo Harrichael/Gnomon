@@ -103,6 +103,14 @@ weighted only when several run in the same interval, and the parts always sum to
 the turn. Solo intervals are also the only clean per-model price observation, so
 they are the sole input to the learned rates.
 
+**Learned rates decay, or they can never be relearned.** Accumulating price
+evidence forever makes a lifetime average that gets stiffer with every sample: if
+Anthropic reprices a model, the old evidence outvotes the new indefinitely.
+Measured on a simulated 3x repricing after 60 days of history — a lifetime mean
+reaches only $20.08 of the true $30.00 after two further months, while a 14-day
+half-life reaches $29.07. `CC_SL_RATE_HALFLIFE` sets it; 0 keeps only the newest
+observation.
+
 **An unknown cost baseline is not zero.** `total_cost_usd` accumulates per
 *process*, so treating a missing baseline as 0 bills one turn for the whole
 session. Anchor on the live reading instead.

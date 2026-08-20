@@ -161,9 +161,10 @@ ASUB = os.path.join(BASE, "att", "subagents")
 TS = "2026-08-20T20:00:00.000Z"
 
 
-def write_parent(*extra):
+def write_parent(*extra, **kw):
+    pid = kw.get("pid", "P1")
     with open(AT, "w") as f:
-        f.write(json.dumps({"type": "user", "promptId": "P1",
+        f.write(json.dumps({"type": "user", "promptId": pid,
                             "message": {"role": "user", "content": "x"}}) + "\n")
         for e in extra:
             f.write(json.dumps(e) + "\n")
@@ -177,10 +178,10 @@ def asst(model, cw, out, mid):
                                   "cache_read_input_tokens": 0, "output_tokens": out}}}
 
 
-def write_agent(aid, entries, name="A"):
+def write_agent(aid, entries, name="A", pid="P1"):
     os.makedirs(ASUB, exist_ok=True)
     with open(os.path.join(ASUB, "agent-%s.jsonl" % aid), "w") as f:
-        f.write(json.dumps({"type": "user", "isSidechain": True, "promptId": "P1",
+        f.write(json.dumps({"type": "user", "isSidechain": True, "promptId": pid,
                             "agentId": aid, "timestamp": TS,
                             "message": {"role": "user", "content": "x"}}) + "\n")
         for e in entries:
@@ -261,6 +262,63 @@ write_agent("A", [asst("m1", 1000, 100, "a1"), asst("m1", 9000, 900, "a2")])
 write_agent("B", [asst("m2", 1000, 100, "b1"), asst("m2", 9000, 900, "b2")])
 run(d3, "S3", "P1", 2.00, tr=AT)
 check("two movers calibrate nothing", rates(d3), {})
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+
+print("\n[12] learned rates must track a repricing, not average it away")
+
+
+def rate_of(db, model):
+    c = sqlite3.connect(db)
+    r = c.execute("SELECT w, usd FROM model_rate WHERE model=?", (model,)).fetchone()
+    c.close()
+    return (r[1] / r[0]) if r and r[0] else None
+
+
+def solo(db, sid, n, up, spend, env=None):
+    """One clean solo-mover interval: agent X is the only thing that moved.
+
+    The agent's file has to GROW between the two redraws — an unchanged file is
+    a no-mover interval, which banks on the parent and calibrates nothing.
+    """
+    pid = "T%d" % n
+    shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+    write_parent(pid=pid)
+    seed = asst("mm", 10, 0, "a%d" % n)
+    write_agent("X", [seed], pid=pid)
+    # cost_delta is only reached when total_cost_usd > 0, so the baseline
+    # redraw needs a nonzero floor; the interval is the difference.
+    run(db, sid, pid, 0.01, tr=AT, env=env)               # baselines
+    write_agent("X", [seed, asst("mm", up, 0, "b%d" % n)], pid=pid)
+    run(db, sid, pid, 0.01 + spend, tr=AT, env=env)       # only X moved
+
+
+W = lambda up: 1.25 * (up + 1)          # weigh(); asst() adds 1 input token
+
+# halflife 0 keeps only the newest observation, so the rate is exactly it
+d = db("rate0")
+solo(d, "R0", 1, 100000, 1.00, env={"CC_SL_RATE_HALFLIFE": "0"})
+check("first solo interval sets the rate",
+      round(rate_of(d, "mm") * 1e6, 2), round(1.00 / W(100000) * 1e6, 2))
+solo(d, "R0", 2, 100000, 3.00, env={"CC_SL_RATE_HALFLIFE": "0"})
+check("halflife=0 relearns the new price exactly",
+      round(rate_of(d, "mm") * 1e6, 2), round(3.00 / W(100000) * 1e6, 2))
+
+# with a long halflife the old evidence still counts, so it lands between
+d = db("ratelong")
+solo(d, "RL", 1, 100000, 1.00, env={"CC_SL_RATE_HALFLIFE": "31536000"})
+solo(d, "RL", 2, 100000, 3.00, env={"CC_SL_RATE_HALFLIFE": "31536000"})
+lo, hi = 1.00 / W(100000), 3.00 / W(100000)
+check("long halflife blends old and new", lo < rate_of(d, "mm") < hi, True)
+
+# the default must actually decay -- a lifetime mean would not move at all here
+d = db("ratedecay")
+solo(d, "RD", 1, 100000, 1.00, env={"CC_SL_RATE_HALFLIFE": "1"})
+time.sleep(3)                                   # ~3 half-lives
+solo(d, "RD", 2, 100000, 3.00, env={"CC_SL_RATE_HALFLIFE": "1"})
+got = rate_of(d, "mm") * 1e6
+want = 3.00 / W(100000) * 1e6
+check("aged evidence is discounted, new price nearly wins",
+      abs(got - want) / want < 0.15, True)
 shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
 
 print("\n%s  (%d pass, %d fail)" % ("ALL PASS" if not FAIL else "FAILURES", OK, FAIL))
