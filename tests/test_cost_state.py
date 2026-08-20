@@ -15,14 +15,15 @@ def check(name, got, want):
     else: FAIL += 1
     print("  %s  %-52s got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
 
-def run(db, sid, pid, cost, ttl=None, env=None, tr=None):
+def run(db, sid, pid, cost, ttl=None, env=None, tr=None, model=None):
     e = dict(os.environ)
     e.update({"CC_SL_STATE_DB": db, "CC_SL_NO_API": "1", "CC_SL_NO_GIT": "1",
               "CC_SL_NO_K8S": "1", "COLUMNS": "400", "LC_ALL": "en_US.UTF-8"})
     if ttl is not None: e["CC_SL_STATE_TTL"] = str(ttl)
     if env: e.update(env)
     body = {"session_id": sid, "prompt_id": pid,
-            "model": {"display_name": "T"}, "workspace": {"current_dir": "/tmp"},
+            "model": model or {"display_name": "T"},
+            "workspace": {"current_dir": "/tmp"},
             "cost": {"total_cost_usd": cost}}
     if tr:
         body["transcript_path"] = tr
@@ -319,6 +320,68 @@ got = rate_of(d, "mm") * 1e6
 want = 3.00 / W(100000) * 1e6
 check("aged evidence is discounted, new price nearly wins",
       abs(got - want) / want < 0.15, True)
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+
+print("\n[13] growth seen in a zero-spend interval must stay claimable")
+
+# Redraws are polled, and stdin's cost lags the transcript flush -- so an agent
+# routinely grows during an interval that has no money in it. If that growth is
+# consumed anyway, the agent reads as a no-mover when the money finally lands
+# and its whole spend falls to the parent. Observed live: 1.36M weighted agent
+# tokens credited at $0.00 across four agents of one turn.
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+write_parent()
+d = db("lag")
+seed = asst("fable", 1000, 100, "l1")
+write_agent("X", [seed])
+run(d, "S13", "P1", 1.00, tr=AT)                    # first sight, spent = 0
+write_agent("X", [seed, asst("fable", 90000, 900, "l2")])
+run(d, "S13", "P1", 1.00, tr=AT)                    # X grew, still no money
+run(d, "S13", "P1", 2.50, tr=AT)                    # money lands, X is static
+ar = agent_rows(d)
+check("unpaid growth is credited when the money arrives",
+      round(ar.get("X", 0.0), 4), 1.50)
+check("it does not fall through to the parent", round(ar.get("", -1.0), 4), 0.0)
+
+print("\n[14] the parent must calibrate too -- but only when it is clean")
+
+
+def passt(model, cw, out, mid):
+    e = dict(asst(model, cw, out, mid))
+    e.pop("isSidechain", None)
+    return e
+
+
+OPUS = {"id": "claude-opus-5[1m]", "display_name": "Opus 5 (1M context)"}
+
+# turn that spawned nothing: the parent is the only possible spender
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+d = db("pcal")
+p0 = passt("x", 10, 0, "q0")
+write_parent(p0)
+run(d, "SP", "P1", 0.01, tr=AT, model=OPUS)         # baseline
+write_parent(p0, passt("x", 100000, 0, "q1"))
+run(d, "SP", "P1", 1.01, tr=AT, model=OPUS)         # +$1.00, parent alone
+check("an agent-free solo interval calibrates the parent",
+      list(rates(d)), ["claude-opus-5"])
+check("rate keyed on model.id, not the display name",
+      round(rates(d)["claude-opus-5"] * 1e6, 2),
+      round(1.00 / (1.25 * 100001) * 1e6, 2))
+
+# same shape, but the turn has an agent in it -- the parent row can carry money
+# banked from unattributable intervals, so it is no longer a clean sample
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+d = db("pcal2")
+write_parent(p0)
+write_agent("W", [asst("fable", 1000, 100, "w1")])
+run(d, "SP2", "P1", 0.01, tr=AT, model=OPUS)        # first sight, spent = 0
+run(d, "SP2", "P1", 0.02, tr=AT, model=OPUS)        # pays off both baselines
+before = agent_rows(d).get("", 0.0)
+write_parent(p0, passt("x", 100000, 0, "q1"))       # only the parent moves now
+run(d, "SP2", "P1", 1.02, tr=AT, model=OPUS)
+check("a turn with agents never calibrates the parent", rates(d), {})
+check("the parent still takes the interval it earned",
+      round(agent_rows(d).get("", 0.0) - before, 4), 1.00)
 shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
 
 print("\n%s  (%d pass, %d fail)" % ("ALL PASS" if not FAIL else "FAILURES", OK, FAIL))

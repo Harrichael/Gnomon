@@ -111,6 +111,27 @@ reaches only $20.08 of the true $30.00 after two further months, while a 14-day
 half-life reaches $29.07. `CC_SL_RATE_HALFLIFE` sets it; 0 keeps only the newest
 observation.
 
+**Never bank token growth an interval could not pay for.** Redraws are polled on
+a timer and stdin's `total_cost_usd` lags the transcript flush, so intervals with
+`spent == 0` are routine. Advancing `w_last` on one of them consumes the growth
+for free: the money lands a tick later with `dw == 0`, the agent reads as a
+no-mover, and its whole spend falls to the parent. Measured on one live turn —
+1.36M weighted agent tokens across four agents, all credited $0.00, with $5.71
+banked on the parent. `w_last` now only moves on an interval that had money in
+it; `updated_at` still moves so GC sees a live row.
+
+**The parent has to arrive in the same model namespace as its agents.**
+`model_rate` is keyed on subagents' `message.model` (`claude-opus-5`), so passing
+stdin's `display_name` (`Opus 5 (1M context)`) meant the parent could never match
+a rate a same-family agent had already learned, and was priced at the mean of all
+known rates in every concurrent split. Key on `model.id` with the `[<n>m]` window
+suffix stripped — that suffix is a context size, not a price.
+
+**The parent calibrates, but only on a turn that spawned nothing.** With agents
+in the turn its row also carries money banked from unattributable intervals, so
+the sample would price the main model with an agent's spend. Agent-free turns are
+the majority, so the main model still calibrates quickly.
+
 **An unknown cost baseline is not zero.** `total_cost_usd` accumulates per
 *process*, so treating a missing baseline as 0 bills one turn for the whole
 session. Anchor on the live reading instead.

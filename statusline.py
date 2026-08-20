@@ -712,7 +712,11 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
         if len(grew) == 1:
             aid, mdl, _w, dw = grew[0]
             share[aid] = spent
-            if aid and mdl and dw > 0:
+            # A lone agent is always a clean observation. The parent is clean
+            # only on a turn that spawned nothing at all -- otherwise its row
+            # also carries money banked from unattributable intervals, and the
+            # sample would price the parent's model with an agent's spend.
+            if mdl and dw > 0 and (aid or not agents):
                 r = con.execute("SELECT w, usd, updated_at FROM model_rate "
                                 "WHERE model=?", (mdl,)).fetchone()
                 w0 = u0 = 0.0
@@ -746,9 +750,18 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
 
     out = {}
     for aid, _mdl, w in parts:
-        cost = prior.get(aid, (0.0, 0.0))[0] + share.get(aid, 0.0)
+        prev_cost, prev_w = prior.get(aid, (0.0, 0.0))
+        cost = prev_cost + share.get(aid, 0.0)
+        # Advance w_last ONLY on an interval that had money in it. Redraws are
+        # polled on a timer and stdin's cost lags the transcript flush, so many
+        # intervals see tokens grow with spent == 0. Banking that growth for
+        # free stranded it: the money landed a tick later with dw == 0, the
+        # agent read as a no-mover, and its whole spend fell to the parent.
+        # Measured on one real turn -- 1.36M weighted agent tokens credited at
+        # $0.00. Holding w_last back keeps the growth claimable until an
+        # interval can pay for it. updated_at still moves so GC sees a live row.
         con.execute("INSERT OR REPLACE INTO agent VALUES (?,?,?,?,?,?)",
-                    (sid, pid, aid, cost, w, NOW))
+                    (sid, pid, aid, cost, w if spent > 0 else prev_w, NOW))
         if aid:
             out[aid] = cost
     return out
@@ -906,8 +919,14 @@ agent_cost = {}
 cost = num(dig("cost", "total_cost_usd"))
 if cost > 0:
     money_txt = f"{MONEY}${cost:.2f}{R}"
+    # model_rate is keyed on the subagents' message.model ("claude-opus-5"), so
+    # the parent has to arrive in the same namespace or it can never match a
+    # rate a same-family agent already learned. stdin carries the context
+    # variant ("claude-opus-5[1m]"); the suffix is a window size, not a price.
+    mid = str(dig("model", "id", default="") or "").split("[")[0]
     d, agent_cost = cost_delta(session_id, prompt_id, cost, agents, parent_w,
-                               dig("model", "display_name", default="") or "")
+                               mid or (dig("model", "display_name",
+                                           default="") or ""))
     if d is not None:
         money_extra = f" {DIM}(+${d:.2f}){R}"
 dur = num(dig("cost", "total_duration_ms"))
