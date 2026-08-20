@@ -44,7 +44,9 @@ of 3-17, so they barely budge however much work happens. ⇧ counts fresh input
 plus cache writes and skips cache reads, which are ~99% of the bytes at a tenth
 of the price. Tokens come free from a bounded backward walk of the transcript;
 only the cost baseline needs disk, in one shared SQLite file keyed by
-(session, turn) that expires its own rows.
+(session, turn) that expires its own rows. Subagents get their own transcripts
+under <session-id>/subagents/, tagged with the parent's promptId, so delegated
+work lands in ⇧ for the turn that asked for it.
 
 Env knobs:
   CC_SL_FULL CC_SL_Q1 CC_SL_HALF CC_SL_Q3 CC_SL_EMPTY   dot glyphs
@@ -69,6 +71,7 @@ Env knobs:
   CC_SL_NO_GIT=1     skip the git probe
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -362,6 +365,76 @@ def fmt_dur(ms):
     return f"{m}m" if m else f"{sec}s"
 
 
+def subagent_tokens(path, pid, seen):
+    """Tokens uploaded by subagents this turn — delegated work is still your spend.
+
+    Claude Code writes each agent to its own transcript beside the parent's, one
+    file per agent and nested agents too:
+
+        <dir>/<session-id>.jsonl                    <- parent
+        <dir>/<session-id>/subagents/agent-*.jsonl  <- one per agent
+
+    Every entry in those files carries the PARENT's promptId, so a file belongs
+    wholly to one turn and its first line settles which. Skipping on that keeps
+    the common case to one readline per agent.
+
+    Don't be tempted by `toolUseResult.totalTokens` in the parent transcript: it
+    is the agent's final request context size, not its cumulative spend, it
+    omits nested agents, and it only appears once the agent finishes.
+
+    `seen` is shared with the parent scan — ids are unique, so one set stops any
+    entry being counted twice.
+    """
+    up = 0
+    try:
+        base = path[:-6] if path.endswith(".jsonl") else path
+        files = glob.glob(os.path.join(base, "subagents", "agent-*.jsonl"))
+    except Exception:
+        return 0
+    for f in files:
+        try:
+            if os.path.getsize(f) > SCAN_CAP:
+                continue
+            with open(f, "rb") as fh:
+                owner = None
+                for _ in range(4):      # first parseable entry names the turn
+                    ln = fh.readline()
+                    if not ln:
+                        break
+                    if not ln.strip():
+                        continue
+                    try:
+                        owner = json.loads(ln).get("promptId")
+                    except Exception:
+                        continue
+                    break
+                if owner != pid:
+                    continue            # someone else's agent: never read the body
+                fh.seek(0)
+                lines = fh.read().split(b"\n")
+            for ln in lines:
+                if not ln.strip():
+                    continue
+                try:
+                    o = json.loads(ln)
+                except Exception:
+                    continue
+                m = o.get("message") or {}
+                u = m.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                rid = m.get("id") or o.get("requestId")
+                if rid is not None:
+                    if rid in seen:
+                        continue
+                    seen.add(rid)
+                up += int(num(u.get("input_tokens"))
+                          + num(u.get("cache_creation_input_tokens")))
+        except Exception:
+            continue
+    return up
+
+
 def turn_tokens(path, pid, chunk=65536):
     """Tokens uploaded during the current human turn + the context it started at.
 
@@ -445,6 +518,7 @@ def turn_tokens(path, pid, chunk=65536):
                 seen.add(rid)
             up += int(num(u.get("input_tokens"))
                       + num(u.get("cache_creation_input_tokens")))
+        up += subagent_tokens(path, pid, seen)
         return up, prev
     except Exception:
         return 0, None

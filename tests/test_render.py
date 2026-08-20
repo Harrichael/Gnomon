@@ -158,6 +158,57 @@ outs = [p.communicate(input=_pl[i]) for i, p in enumerate(procs)]
 check("all 8 exited 0", [p.returncode for p in procs], [0] * 8)
 check("no 'locked'/'error' on stderr", any("lock" in e.lower() or "error" in e.lower() for _, e in outs), False)
 
+print("\n[7b] subagent uploads — delegated work belongs to the turn that asked")
+# Claude Code writes each agent beside the parent as
+#   <transcript-without-.jsonl>/subagents/agent-<id>.jsonl
+# and tags every entry with the PARENT's promptId.
+TRS = os.path.join(T, "tr_sub.jsonl")
+with open(TRS, "w") as f:
+    for e in [U("AAA"), A(10, 90, 1000, 5), U("BBB"), A(1, 99, 2000, 10)]:
+        f.write(json.dumps(e) + "\n")
+SUB = os.path.join(T, "tr_sub", "subagents"); os.makedirs(SUB, exist_ok=True)
+
+def agent_file(name, pid, entries):
+    with open(os.path.join(SUB, name), "w") as f:
+        f.write(json.dumps(dict(U(pid), isSidechain=True)) + "\n")
+        for e in entries:
+            f.write(json.dumps(dict(e, isSidechain=True, promptId=pid)) + "\n")
+
+# BBB's own upload is 1+99=100; its agents add 500 and 40.
+agent_file("agent-aaa.jsonl", "BBB", [A(200, 300, 9000, 50)])
+agent_file("agent-bbb.jsonl", "BBB", [A(10, 30, 500, 5)])
+agent_file("agent-ccc.jsonl", "AAA", [A(7000, 1000, 100, 5)])   # different turn
+rc, o = run(payload("BBB", 5000, tr=TRS))
+check("subagent tokens fold into up", grab(o, "⇧"), "640")
+rc, o = run(payload("AAA", 5000, tr=TRS))
+check("other turn's agent excluded from BBB", grab(o, "⇧"), "8.1K")
+
+# One response spanning several content blocks must still count once, and ids are
+# shared with the parent scan so nothing is double counted.
+agent_file("agent-ddd.jsonl", "DDD", [
+    dict(A(5, 45, 100, 5), message=dict(A(5, 45, 100, 5)["message"], id="m1")),
+    dict(A(5, 45, 100, 5), message=dict(A(5, 45, 100, 5)["message"], id="m1")),
+])
+with open(TRS, "a") as f:
+    f.write(json.dumps(U("DDD")) + "\n")
+rc, o = run(payload("DDD", 5000, tr=TRS))
+check("duplicate content blocks counted once", grab(o, "⇧"), "50")
+
+# Degradation: a corrupt agent file must not take the line down.
+with open(os.path.join(SUB, "agent-bad.jsonl"), "w") as f:
+    f.write('{"promptId":"BBB","isSidechain":true}\n{not json\n')
+rc, o = run(payload("BBB", 5000, tr=TRS))
+check("corrupt agent file: exit 0", rc, 0)
+check("corrupt agent file: up still correct", grab(o, "⇧"), "640")
+
+# An agent file larger than the scan cap is skipped, not read.
+rc, o = run(payload("BBB", 5000, tr=TRS), env={"CC_SL_SCAN_CAP": "80"})
+check("oversized agent files skipped", grab(o, "⇧"), "100")
+
+# No subagents directory at all — the common case must be untouched.
+rc, o = run(payload("BBB", 5000))
+check("no subagents dir: unchanged", grab(o, "⇧"), "200")
+
 print("\n[8] timing")
 pl = json.dumps(payload("CCC", 5000))
 e = dict(os.environ, HOME=HOME, COLUMNS="200", CC_SL_NO_API="1", CC_SL_NO_GIT="1", CC_SL_NO_K8S="1", TMPDIR=T)

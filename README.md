@@ -16,7 +16,7 @@ layout, install, and the invariants that are easy to break by accident.
 
     statusline.py            the whole thing; deployed to ~/.claude/statusline.py
     install.sh               runs the tests, then installs + registers it
-    tests/test_render.py     32 checks: rendering, widths, degradation, timing
+    tests/test_render.py     39 checks: rendering, subagents, widths, degradation
     tests/test_cost_state.py 25 checks: cost baselines, GC, multi-session
     tests/fixtures/          a captured real stdin payload
     archive/                 pre-feature snapshot, kept from before git existed
@@ -65,6 +65,20 @@ without an upper bound the scan sums every later turn too.
 **Parse only newly-read chunks when walking backward.** Re-parsing the whole
 accumulated buffer is O(n²): 24.6 ms at 4 KB chunks vs 2.2 ms at 64 KB.
 
+**Subagent work lives in its own transcript.** Delegated tokens are not in the
+parent file — Claude Code writes one file per agent (nested agents included) at
+`<transcript-without-.jsonl>/subagents/agent-*.jsonl`, and every entry there
+carries the *parent's* `promptId`, so a file belongs wholly to one turn. Miss
+them and a turn that delegates reads at a fraction of its real upload: measured
+8,907 parent tokens against 121,026 from its two agents. Check the first line's
+`promptId` before reading a body, or every redraw re-reads every agent a session
+ever spawned.
+
+**Do not use `toolUseResult.totalTokens` from the parent transcript.** It is the
+agent's *final request context size*, not cumulative spend; it omits nested
+agents; and it only appears once the agent finishes. It is the obvious number to
+reach for and it is wrong.
+
 **An unknown cost baseline is not zero.** `total_cost_usd` accumulates per
 *process*, so treating a missing baseline as 0 bills one turn for the whole
 session. Anchor on the live reading instead.
@@ -83,9 +97,6 @@ row for the turn in progress.
 
 ## Known limitations
 
-- **Subagent tokens are invisible to `⇧`.** Delegated work is not written to the
-  session transcript (no `isSidechain` entries are produced), so a turn that
-  spawns subagents reads low on `⇧` while `+$` still includes their cost.
 - **A resumed session's first turn under-reports** by whatever was spent before
   its first redraw — bounded by `refreshInterval`, so ≤10 s of spend.
 - **Retention is per-session, not per-row.** A session left open forever keeps
