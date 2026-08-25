@@ -139,10 +139,29 @@ check("every session got its own +$0.50", [m.group(1) if m else None for m in de
 check("12 rows, no cross-session bleed", len(rows(d)), 12)
 
 print("\n[9] the live DB is never touched by a fixture run")
-before = open(os.path.expanduser("~/.claude/gnomon-state.db"), "rb").read()
+LIVE = os.path.expanduser("~/.claude/gnomon-state.db")
+
+
+def live_snapshot():
+    """Bytes of the real DB, or None when there isn't one.
+
+    A machine seeing gnomon for the first time has no live DB at all — and that
+    is exactly the state install.sh runs the suite in. Demanding the file exist
+    turned a first install into a FileNotFoundError before anything was copied.
+    "Unchanged" has to include "still absent".
+    """
+    try:
+        with open(LIVE, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+before = live_snapshot()
 run(db("iso"), "8d64c573-079a-40dd-8aad-1f11d2ace44a", "4c66c4e5", 11.75)
-after = open(os.path.expanduser("~/.claude/gnomon-state.db"), "rb").read()
-check("CC_SL_STATE_DB isolates writes from the real DB", before == after, True)
+check("CC_SL_STATE_DB isolates writes from the real DB",
+      live_snapshot() == before, True)
+check("and a fixture run never conjures one", os.path.exists(LIVE), before is not None)
 
 print("\n[10] degradation still intact")
 d = db("deg")

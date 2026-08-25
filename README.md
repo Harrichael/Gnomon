@@ -49,13 +49,36 @@ rendering one renders the other.
 
 ## Install
 
-    ./gnomon/install.sh
+    git clone <repo> && ./gnomon/install.sh
 
-Copies the script to `~/.claude/gnomon.py` and merges a `statusLine` block
-into `~/.claude/settings.json` without disturbing other settings. It runs both
-suites against the repo copy first and aborts if either fails.
+**Requirements:** Python 3.9+ and Claude Code. Nothing else — no pip, no
+third-party packages, standard library only. Verified end to end on the macOS
+system `python3` (3.9.6), which is what a machine has before anyone installs
+anything. `git` and `kubectl` are used if present and silently skipped if not.
+
+The installer runs both suites against the repo copy first and aborts if either
+fails, then copies the script to `~/.claude/gnomon.py` and merges a `statusLine`
+block into `~/.claude/settings.json` — merges, so unrelated settings (theme,
+voice, permissions) survive. It creates `~/.claude` if it doesn't exist, and
+works against a machine with no `settings.json` at all.
+
+**No database setup.** `~/.claude/gnomon-state.db` is created on the first
+redraw, tables and all, and every schema change since has been an
+`IF NOT EXISTS` or a guarded `ALTER`. There is nothing to migrate and nothing to
+seed.
+
+**What a first session looks like.** The very first turn reads `(+$0.00)`. That
+is correct, not a bug: `total_cost_usd` accumulates per process, so with no prior
+turn on record the baseline is *unknown*, and anchoring it at zero would bill one
+turn for the entire session. It anchors on the live reading instead and is exact
+from the second turn onward. Per-model rates start empty and learn from use — the
+first concurrent subagent split is priced by unweighted tokens until a model has
+run alone once. Everything else is right immediately.
 
 `refreshInterval` is read at startup, so **restart open sessions** after install.
+
+**Uninstall:** delete `~/.claude/gnomon.py`, `~/.claude/gnomon-state.db*`, and
+the `statusLine` block from `~/.claude/settings.json`.
 
 ## Tests
 
