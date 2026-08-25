@@ -49,7 +49,8 @@ rendering one renders the other.
 
 ## Install
 
-    git clone <repo> && ./gnomon/install.sh
+    git clone git@github.com:Harrichael/Gnomon.git
+    cd Gnomon && ./install.sh
 
 **Requirements:** Python 3.9+ and Claude Code. Nothing else — no pip, no
 third-party packages, standard library only. Verified end to end on the macOS
@@ -82,13 +83,13 @@ the `statusLine` block from `~/.claude/settings.json`.
 
 ## Tests
 
-    python3 gnomon/tests/test_render.py
-    python3 gnomon/tests/test_cost_state.py
+    python3 tests/test_render.py
+    python3 tests/test_cost_state.py
 
 By default both exercise the *deployed* script. Set `SL_SCRIPT` to point at a
 candidate instead:
 
-    SL_SCRIPT=gnomon/gnomon.py python3 gnomon/tests/test_render.py
+    SL_SCRIPT=./gnomon.py python3 tests/test_render.py
 
 Fixtures (transcripts, sandbox `HOME`s, scratch databases) are generated at run
 time inside `tests/` and are gitignored. Nothing touches the real
