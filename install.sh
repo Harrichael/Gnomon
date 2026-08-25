@@ -73,8 +73,16 @@ if os.path.exists(src):
 sl = d.get("statusLine")
 if not isinstance(sl, dict):
     sl = collections.OrderedDict()
-sl.update({"type": "command", "command": "python3 ~/.claude/gnomon.py",
-           "padding": 0, "refreshInterval": 10})
+
+# Wiring vs tuning. `type` and `command` say WHERE the status line comes from --
+# the installer owns those forever, so re-running always corrects a stale path.
+# `padding` and `refreshInterval` are TUNING, and belong to whoever is looking at
+# the thing. Forcing them on every run was a real bug once this was installed by
+# a bootstrap that reruns on every pass: a tuned refreshInterval was reverted by
+# a bootstrap invoked for entirely unrelated reasons. Seed them, then let go.
+sl.update({"type": "command", "command": "python3 ~/.claude/gnomon.py"})
+sl.setdefault("padding", 0)
+sl.setdefault("refreshInterval", 10)
 d["statusLine"] = sl
 
 with open(staged, "w") as f:

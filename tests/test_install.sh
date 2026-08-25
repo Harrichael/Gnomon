@@ -61,6 +61,34 @@ check "a stale command is corrected" \
   "$(python3 -c "import json;print(json.load(open('$H/.claude/settings.json'))['statusLine']['command'])")" \
   "python3 ~/.claude/gnomon.py"
 
+# Wiring converges; tuning is seeded once and then belongs to the user. The
+# checks above would all stay green if this were wrong -- they only ever install
+# over values this installer itself wrote. Tune one first, then install.
+H="$SANDBOX/tuned"; mkdir -p "$H/.claude"
+cat > "$H/.claude/settings.json" <<'JSON'
+{"statusLine": {"type": "command", "command": "python3 ~/.claude/OLD.py",
+                "padding": 2, "refreshInterval": 3}}
+JSON
+run "$H"
+check "a tuned refreshInterval survives a re-run" \
+  "$(python3 -c "import json;print(json.load(open('$H/.claude/settings.json'))['statusLine']['refreshInterval'])")" \
+  "3"
+check "a tuned padding survives too" \
+  "$(python3 -c "import json;print(json.load(open('$H/.claude/settings.json'))['statusLine']['padding'])")" \
+  "2"
+check "but wiring is still corrected around them" \
+  "$(python3 -c "import json;print(json.load(open('$H/.claude/settings.json'))['statusLine']['command'])")" \
+  "python3 ~/.claude/gnomon.py"
+run "$H"; D="$(shasum < "$H/.claude/settings.json")"
+run "$H"
+check "and tuned values still converge across runs" \
+  "$([ "$D" = "$(shasum < "$H/.claude/settings.json")" ] && echo same || echo drifted)" "same"
+
+# On a machine with no opinion yet, the defaults are still seeded.
+check "virgin install seeds the defaults" \
+  "$(python3 -c "import json;d=json.load(open('$SANDBOX/virgin/.claude/settings.json'))['statusLine'];print(d['padding'],d['refreshInterval'])")" \
+  "0 10"
+
 echo
 echo "[3] malformed settings.json -- refuse, and change nothing"
 H="$SANDBOX/bad"; mkdir -p "$H/.claude"
