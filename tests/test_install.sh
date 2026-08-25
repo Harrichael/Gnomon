@@ -3,8 +3,8 @@
 # these cover what the installer does to your machine -- which is the part that
 # can only be got wrong once, on someone else's laptop.
 #
-# Runs install.sh with --skip-tests throughout: the suites are exercised by
-# install.sh itself, and running them five more times costs 90s for no coverage.
+# install.sh no longer runs the suites -- that is ./test.sh -- so calling it here
+# is cheap and there is no bypass flag to thread through.
 #
 #   ./tests/test_install.sh
 set -uo pipefail
@@ -20,8 +20,8 @@ check() {  # check <name> <got> <want>
   else FAIL=$((FAIL+1)); printf "  FAIL  %-52s got=%s want=%s\n" "$1" "$2" "$3"; fi
 }
 
-run() {  # run <home> -> exit code, stderr captured in $ERR
-  ERR="$(HOME="$1" bash "$REPO/install.sh" --skip-tests 2>&1 >/dev/null)"
+run() {  # run <home> [repo] -> exit code, stderr captured in $ERR
+  ERR="$(HOME="$1" bash "${2:-$REPO}/install.sh" 2>&1 >/dev/null)"
   return $?
 }
 
@@ -90,10 +90,28 @@ check "script NOT deployed" \
   "$([ -f "$H/.claude/gnomon.py" ] && echo deployed || echo absent)" "absent"
 
 echo
-echo "[5] argument handling"
+echo "[5] a script too broken to run must never be installed"
+# The smoke check is all that stands between a bad edit and something that
+# executes on every keystroke. Corrupt a throwaway copy of the repo and confirm
+# install.sh refuses it.
+BROKEN="$SANDBOX/broken-repo"
+cp -R "$REPO" "$BROKEN"
+rm -rf "$BROKEN/.git"
+printf '\nthis is not python(\n' >> "$BROKEN/gnomon.py"
+H="$SANDBOX/broken"; mkdir -p "$H"
+run "$H" "$BROKEN"; check "exits non-zero" "$([ "$?" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+check "says the script would not run" \
+  "$(echo "$ERR" | grep -qi "failed to run" && echo explained || echo "$ERR")" "explained"
+check "nothing deployed" \
+  "$([ -f "$H/.claude/gnomon.py" ] && echo deployed || echo absent)" "absent"
+check "settings.json never created" \
+  "$([ -f "$H/.claude/settings.json" ] && echo created || echo absent)" "absent"
+
+echo
+echo "[6] argument handling"
 H="$SANDBOX/args"; mkdir -p "$H"
-HOME="$H" bash "$REPO/install.sh" --nonsense >/dev/null 2>&1
-check "an unknown flag exits 2 without installing" \
+HOME="$H" bash "$REPO/install.sh" --skip-tests >/dev/null 2>&1
+check "the retired --skip-tests flag exits 2 without installing" \
   "$?:$([ -f "$H/.claude/gnomon.py" ] && echo deployed || echo absent)" "2:absent"
 
 echo

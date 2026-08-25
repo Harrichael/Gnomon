@@ -57,8 +57,14 @@ third-party packages, standard library only. Verified end to end on the macOS
 system `python3` (3.9.6), which is what a machine has before anyone installs
 anything. `git` and `kubectl` are used if present and silently skipped if not.
 
-The installer runs both suites against the repo copy first and aborts if either
-fails, then copies the script to `~/.claude/gnomon.py` and merges a `statusLine`
+`install.sh` installs and nothing else — testing is `./test.sh`, worth running
+first. What the installer *does* do is a **smoke check**: render the sample
+payload once against a scratch database with the network off, and refuse to
+deploy anything that will not run. It costs ~0.1s and catches the failure that
+matters at that moment — a script too broken to execute, on its way to something
+that runs on every keystroke.
+
+It then copies the script to `~/.claude/gnomon.py` and merges a `statusLine`
 block into `~/.claude/settings.json` — merges, so unrelated settings (theme,
 voice, permissions) survive. It creates `~/.claude` if it doesn't exist, and
 works against a machine with no `settings.json` at all.
@@ -88,29 +94,27 @@ copied, so a `settings.json` that cannot be parsed aborts with a plain-language
 message and leaves you exactly as you were. It used to fail halfway — script
 deployed, nothing registered, a raw `JSONDecodeError` as the only clue.
 
-`./install.sh --skip-tests` installs a copy already known good, skipping the ~18s
-of suites.
-
 **Uninstall:** delete `~/.claude/gnomon.py`, `~/.claude/gnomon-state.db*`, and
 the `statusLine` block from `~/.claude/settings.json`.
 
 ## Tests
 
-    python3 tests/test_render.py
-    python3 tests/test_cost_state.py
-    ./tests/test_install.sh
+    ./test.sh              all three suites against the repo copy
+    ./test.sh render       one by name: render | cost | install
 
-The first two cover what gnomon renders. The third covers what `install.sh` does
-to your machine — the part that can only be got wrong once, on someone else's
-laptop: a fresh `HOME` with no `~/.claude`, three runs converging rather than
-accumulating, and a malformed `settings.json` being refused without leaving a
-half-install behind. It runs `install.sh --skip-tests` throughout, since running
-the Python suites five more times costs 90 seconds and covers nothing new.
+`render` and `cost` cover what gnomon draws and what it records. `install` covers
+what `install.sh` does to a machine — the part that can only be got wrong once,
+on someone else's laptop: a fresh `HOME` with no `~/.claude`, three runs
+converging rather than accumulating, a malformed `settings.json` refused without
+leaving a half-install behind, and a deliberately corrupted `gnomon.py` never
+reaching the deploy target.
 
-By default the first two exercise the *deployed* script. Set `SL_SCRIPT` to point at a
-candidate instead:
+The suites also run directly, and on their own they exercise the *deployed*
+script — handy for checking what is actually live on your machine. `./test.sh`
+points them at the repo copy instead, which is what you want before installing:
 
-    SL_SCRIPT=./gnomon.py python3 tests/test_render.py
+    python3 tests/test_cost_state.py                     # the deployed script
+    SL_SCRIPT=./gnomon.py python3 tests/test_render.py   # a candidate
 
 Fixtures (transcripts, sandbox `HOME`s, scratch databases) are generated at run
 time inside `tests/` and are gitignored. Nothing touches the real

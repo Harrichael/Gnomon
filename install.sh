@@ -1,37 +1,48 @@
 #!/usr/bin/env bash
-# Deploy gnomon: copy the script into ~/.claude and register it in
+# Install gnomon: copy the script into ~/.claude and register it in
 # settings.json. Idempotent -- safe to re-run after editing gnomon.py.
 #
-# All-or-nothing on purpose. The merged settings are staged BEFORE anything is
-# copied, so a settings.json that cannot be parsed leaves you exactly as you
-# were. It used to fail halfway: script deployed, nothing registered, and a raw
-# JSONDecodeError as the only clue.
+# This installs. It does not test; that is ./test.sh, and it is worth running
+# before you install. What happens here instead is a smoke check: render the
+# sample payload once and require a clean exit. It costs ~0.1s and catches the
+# failure that actually matters at this moment -- a script too broken to run at
+# all, on its way to something that executes on every keystroke.
 #
-#   ./install.sh                run the suites, then install
-#   ./install.sh --skip-tests   install a copy already known good (~18s faster)
+# All-or-nothing. The merged settings are staged BEFORE anything is copied, so
+# any failure below leaves you exactly as you were. It used to fail halfway:
+# script deployed, nothing registered, a raw JSONDecodeError as the only clue.
 set -euo pipefail
+
+if [ -n "${1:-}" ]; then
+  echo "usage: install.sh          (run ./test.sh separately)" >&2
+  exit 2
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="$HOME/.claude/gnomon.py"
 SETTINGS="$HOME/.claude/settings.json"
 STAGED="$SETTINGS.staged.$$"
-trap 'rm -f "$STAGED"' EXIT
+SMOKE="$(mktemp -d "${TMPDIR:-/tmp}/gnomon-smoke.XXXXXX")"
+trap 'rm -f "$STAGED"; rm -rf "$SMOKE"' EXIT
 
-if [ "${1:-}" = "--skip-tests" ]; then
-  echo "skipping tests (--skip-tests)"
-elif [ -n "${1:-}" ]; then
-  echo "usage: install.sh [--skip-tests]" >&2
-  exit 2
-else
-  # Test the repo copy before it becomes the live one.
-  SL_SCRIPT="$HERE/gnomon.py" python3 "$HERE/tests/test_render.py"
-  SL_SCRIPT="$HERE/gnomon.py" python3 "$HERE/tests/test_cost_state.py"
+# Smoke check. Redirected at a scratch database and with the network off, so it
+# cannot touch your state or stall on an API call.
+if ! CC_SL_STATE_DB="$SMOKE/state.db" CC_SL_NO_API=1 \
+     python3 "$HERE/gnomon.py" < "$HERE/tests/fixtures/sample_stdin.json" \
+     > "$SMOKE/out" 2> "$SMOKE/err"; then
+  echo "gnomon: $HERE/gnomon.py failed to run -- nothing installed." >&2
+  sed 's/^/        /' "$SMOKE/err" >&2
+  exit 1
+fi
+if [ ! -s "$SMOKE/out" ]; then
+  echo "gnomon: $HERE/gnomon.py produced no output -- nothing installed." >&2
+  exit 1
 fi
 
 mkdir -p "$HOME/.claude"
 
 # Stage the merged settings. Nothing of yours has been written yet, so every
-# failure below is a clean no-op.
+# failure below this point is a clean no-op.
 python3 - "$SETTINGS" "$STAGED" <<'PY'
 import collections, json, os, sys
 
