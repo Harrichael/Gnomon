@@ -21,9 +21,11 @@ layout, install, and the invariants that are easy to break by accident.
 ## Layout
 
     gnomon.py                the whole thing; deployed to ~/.claude/gnomon.py
-    install.sh               runs the tests, then installs + registers it
-    tests/test_render.py     105 checks: rendering, subagent rows, widths, degradation
-    tests/test_cost_state.py  53 checks: cost baselines, per-agent attribution, GC
+    install.sh               installs + registers it (testing is ./test.sh)
+    test.sh                  every suite against the repo copy
+    tests/test_render.py     112 checks: rendering, subagent rows, widths, degradation
+    tests/test_cost_state.py  67 checks: cost baselines, per-agent attribution, GC
+    tests/test_install.sh     34 checks: what the installer does to a machine
     tests/fixtures/          a captured real stdin payload
     archive/                 pre-feature snapshot, kept from before git existed
 
@@ -34,6 +36,21 @@ upload, line 2 stating its level as a number and agent rows as a bar:
 
     ⛁ ██░░░░░░░░ 23% of 1M │ ↓ 232.5K (+64.9K)  ⇧ 105.1K │ +458/-173 │ $11.76 …
       ⇉ fable   ███░░░ 38%  ⇧ 75.6K  ⏱ 7m42s  (+$0.62)  Audit state schema ✓
+      ⇉ opus    ██░░░░ 23%  ⇧ 45.4K  ⏱ 12m03s (+$0.31)  Long running thing ↩
+
+Status sits at the end of the name, the only unaligned field: `✓` finished, `↩`
+still working but started in an **earlier** turn. That second case is the one the
+rows exist for — a foreground agent is visible because you are waiting on it,
+whereas a background agent is invisible by definition, so this line is the only
+signal there is. Carried rows are dropped once the agent finishes, and
+`CC_SL_AGENT_CARRY` (1800s of silence, `0` to disable) bounds how long a quiet
+one is presumed alive. It is deliberately *not* `CC_SL_AGENT_STALE`: that decides
+a tick mark, this decides whether a row exists at all, and healthy agents go
+quiet for minutes while blocked in a tool.
+
+A carried agent's uploads are **not** added to line 2's `⇧` — they belong to the
+turn that spawned it — and its cost ledger is seeded on arrival so it is credited
+only for what it does from that point on.
 
 Agent rows carry no output column. A down arrow there read as the opposite of
 line 2's `↓` while meaning something unrelated, which is exactly the sort of
@@ -68,6 +85,35 @@ It then copies the script to `~/.claude/gnomon.py` and merges a `statusLine`
 block into `~/.claude/settings.json` — merges, so unrelated settings (theme,
 voice, permissions) survive. It creates `~/.claude` if it doesn't exist, and
 works against a machine with no `settings.json` at all.
+
+**What the installer owns, and what it does not.** Inside `statusLine`, `type`
+and `command` are *wiring* — they say where the status line comes from, the
+installer owns them permanently, and re-running always corrects a stale path.
+`padding` and `refreshInterval` are *tuning*: seeded on first install, then
+yours. This became a real bug the moment a bootstrap started delegating here on
+every pass — a tuned `refreshInterval` was reverted by a run invoked for entirely
+unrelated reasons. Everything else in the file, inside the block or outside it,
+is untouched.
+
+**The deployment source is deliberately not written into `settings.json`.** The
+command is always `python3 ~/.claude/gnomon.py`, never the path of the checkout
+it came from. Putting a source path there couples the status line to that
+location's layout — a package registry's internal format, say — so the registry
+could never change shape without breaking every install, and recovery from a
+moved or pruned source becomes hand-editing JSON instead of re-running the
+installer. If a by-reference mode is ever wanted, the shape is a symlink at
+`~/.claude/gnomon.py` plus a refusal to link a dirty checkout, *not* a rewritten
+command. This was argued out and rejected once already; the trade it loses is the
+smoke gate on updates, since a `git pull` would then go live with nothing between
+the pull and the next keystroke.
+
+**Which clone deployed?** Any checkout anywhere can run `install.sh` and become
+the deployed version; the smoke check proves it *runs*, not that it is current,
+so a stale clone installs a silent downgrade. The installer prints
+`deployed from <path> @ <commit>` and leaves `~/.claude/gnomon.provenance`
+(source, commit, dirty flag) so that question is answerable months later. Without
+git it records `commit=unknown` and installs anyway — this has to work from a
+tarball.
 
 **No database setup.** `~/.claude/gnomon-state.db` is created on the first
 redraw, tables and all, and every schema change since has been an
@@ -280,9 +326,19 @@ SL_SCRIPT=/tmp/mut.py python3 tests/test_render.py   # must report exactly 2 fai
   it. An agent on the main model borrows the main window, `resolvedModel`'s `[1m]`
   marker is honoured when present, and everything else falls back to
   `CC_SL_AGENT_CTX`. A wrong guess makes the bar read too full, never too empty.
-- **An async agent that outlives its turn disappears** from the rows at the next
-  prompt while still burning tokens. Rows are `promptId`-scoped, which is what
-  keeps the scan bounded and the no-agent case free.
+- **A carried agent's row mixes scopes.** An agent still working from an earlier
+  turn shows *lifetime* `⇧` and `⏱` beside a *this-turn* `(+$…)`. Each is the
+  most useful reading of its own field, so this is deliberate — but do not expect
+  `⇧ × rate ≈ $` to reconcile on a row marked `↩`.
+- **`SCAN_CAP` can still hide the agent you most want.** A file over 4 MB is
+  skipped without trace, and a long-running background agent is exactly the file
+  most likely to reach it — so the case carried rows exist for can still vanish,
+  now inexplicably. A degraded name-only row would fix it and is not built yet.
+- **A lingering background agent stops the main model calibrating.** Agent-free
+  turns are the parent's only source of rate samples, and a carried row makes the
+  turn non-empty for as long as it lasts. This is correct — the parent's banked
+  money may contain that agent's lagged spend — but it means main-model
+  convergence quietly slows while you delegate in the background.
 - **A resumed session's first turn under-reports** by whatever was spent before
   its first redraw — bounded by `refreshInterval`, so ≤10 s of spend.
 - **Retention is per-session, not per-row.** A session left open forever keeps
@@ -296,8 +352,12 @@ SL_SCRIPT=/tmp/mut.py python3 tests/test_render.py   # must report exactly 2 fai
   toward the middle. That is what a constant additive error looks like when it
   lands on samples of very different sizes. `CC_SL_RATE_FLOOR` and
   `CC_SL_RATE_OUTLIER` contain the damage; neither explains it. The full note,
-  with the three places to look and the suggested next step (log raw calibration
-  samples under a flag and look at the scatter before theorising further), is the
-  block comment above `attribute()`. Bounded meanwhile: rates only divide an
+  with the three places to look, is the block comment above `attribute()`. Its
+  suggested next step now exists: `CC_SL_RATE_LOG=1` records every calibration
+  sample — model, `dw`, `spent`, that participant's share, the mover count and
+  whether it was accepted — to a `rate_sample` table, so the scatter can be
+  looked at before anyone theorises further. Rejected and contaminated intervals
+  are logged too; seeing what was *excluded* is most of the point. Off by
+  default, and the table is not created unless it is on. Bounded meanwhile: rates only divide an
   interval between concurrent participants — every solo interval is measured
   money, and line 2's total never depends on them.

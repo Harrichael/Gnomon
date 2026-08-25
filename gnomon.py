@@ -7,6 +7,11 @@ reading. From γιγνώσκω, "that which knows".
 Line 1  identity   model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
 Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added)  ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
 Line 2b agents     ⇉ model  ███░░░ 38%  ⇧up  ⏱ran  (+$spent)  name ✓
+                   ✓ finished, ↩ still working but spawned in an EARLIER
+                   turn. A carried row mixes scopes on purpose: ⇧ and ⏱
+                   are lifetime, (+$…) is this turn only, since each is
+                   the most useful reading of its own field. So ⇧ x rate
+                   will not reconcile against $ on a row marked ↩.
 Line 3  limits     5h ●●●◑○ 62% ↻2h11m │ 7d ●◑○○○○○ 23% ↻4d6h │ fable ●●●◑○○○ 51% ↻3d1h
 
 Line 2b appears once per subagent this turn and disappears when none ran. A turn
