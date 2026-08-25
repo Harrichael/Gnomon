@@ -336,6 +336,13 @@ SCAN_CAP = int(num(E("CC_SL_SCAN_CAP"), 4 << 20))
 # running agents already reach ~110s on short read-only work.
 AGENT_STALE = int(num(E("CC_SL_AGENT_STALE"), 300))
 AGENT_MAX = int(num(E("CC_SL_AGENT_MAX"), 6))
+# How long an agent from an EARLIER turn keeps its row. Separate from
+# AGENT_STALE on purpose: that one prices a wrong answer at a tick mark,
+# this one prices it at whether the row exists at all. Measured gaps inside
+# healthy agents already reach 109s, and one blocked in a long Bash writes
+# nothing for minutes, so a false "dead" here would recreate the very
+# invisibility this exists to fix -- and would flicker while doing it.
+AGENT_CARRY = int(num(E("CC_SL_AGENT_CARRY"), 1800))
 AGENT_CTX = int(num(E("CC_SL_AGENT_CTX"), 200000))
 # Half-life of learned per-model price evidence. A lifetime average gets
 # stiffer with every sample and would sit on a stale price forever; decaying
@@ -538,8 +545,15 @@ def subagent_scan(path, pid, seen):
                     except Exception:
                         continue
                     break
-                if owner != pid:
-                    continue            # someone else's agent: never read the body
+                # An async agent outlives the turn that spawned it, and that
+                # is exactly when its row matters most: you cannot see a
+                # background agent working, so this line is the only signal. Keep
+                # a foreign agent while it is still alive; a dead one keeps the
+                # one-readline skip, which is the bulk of them.
+                foreign = owner != pid
+                if foreign and not (AGENT_CARRY > 0
+                                    and NOW - int(st.st_mtime) <= AGENT_CARRY):
+                    continue            # someone else's, and finished with
                 fh.seek(0)
                 lines = fh.read().split(b"\n")
             up, out, cr = {}, {}, {}
@@ -571,11 +585,16 @@ def subagent_scan(path, pid, seen):
                     continue
                 rid = m.get("id") or o.get("requestId")
                 inp = num(u.get("input_tokens")) + num(u.get("cache_creation_input_tokens"))
+                # A foreign agent's uploads belong to the turn that spawned
+                # it, so they must not land in this turn's line-2 total -- and
+                # its ids must stay out of the shared `seen` set for the same
+                # reason. Its own per-file numbers are collected either way.
                 if rid is None:
-                    up_total += int(inp)
+                    if not foreign:
+                        up_total += int(inp)
                     up_free += inp
                 else:
-                    if rid not in seen:
+                    if not foreign and rid not in seen:
                         seen.add(rid)
                         up_total += int(inp)
                     if rid not in up:
@@ -602,6 +621,7 @@ def subagent_scan(path, pid, seen):
                 "t0": t0,
                 "tend": tend,
                 "mtime": int(st.st_mtime),
+                "foreign": foreign,
             })
         except Exception:
             continue
@@ -722,6 +742,10 @@ def turn_tokens(path, pid, chunk=65536):
         for a in agents:
             a["done"] = agent_done(a, done_ids)
             a["res"] = res.get(a["aid"], "")
+        # Carry a foreign agent only while it is still working. Once it has
+        # finished it belongs to the turn that spawned it, and showing a
+        # completed row from three prompts ago is noise, not information.
+        agents = [a for a in agents if not (a.get("foreign") and a["done"])]
         agents.sort(key=lambda a: (a["t0"] or "", a["aid"]))
         return up, prev, agents, pw
     except Exception:
@@ -820,6 +844,19 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
     prior = {r[0]: (float(r[1]), float(r[2])) for r in con.execute(
         "SELECT agent_id, cost, w_last FROM agent "
         "WHERE session_id=? AND prompt_id=?", (sid, pid))}
+    # An agent carried in from an earlier turn has no row for THIS one, so it
+    # would arrive with w_last = 0 and its first paid interval would credit it
+    # with its entire lifetime weight -- hundreds of thousands of weighted tokens
+    # of work it did under a previous prompt, taken out of the parent's share and
+    # folded into that model's learned rate. Seed it at its current weight so
+    # only what it does from here counts.
+    #
+    # The seed is not banked growth, it is DISCLAIMED growth, so the
+    # only-advance-w_last-on-a-paid-interval rule below does not apply to it: the
+    # write loop persists prev_w on an unpaid interval, which is exactly the seed.
+    for a in agents:
+        if a.get("foreign") and a["aid"] not in prior:
+            prior[a["aid"]] = (0.0, weigh(a["up"], a.get("cr", 0), a["out"]))
     parts = [("", main_model, parent_w)]
     for a in agents:
         parts.append((a["aid"], a["model"],
@@ -1415,7 +1452,10 @@ def compose_agents(rows, costs, main_family, main_win, level=0):
         if level < 3 and r["aid"] in costs:
             seg.append(f"{DIM}(+${costs[r['aid']]:.2f}){R}")
         fixed.append(seg)
-        names.append(r["name"] + (" ✓" if r.get("done") else ""))
+        # Status lives at the end of the name -- the only unaligned, sheddable
+        # field -- so ↩ follows the same convention ✓ already set.
+        names.append(r["name"] + (" ✓" if r.get("done")
+                                  else (" ↩" if r.get("foreign") else "")))
 
     # Pad each column to the block's widest, so the numbers line up in a column
     # rather than wherever the model name happens to end.
@@ -1446,7 +1486,18 @@ if agents and not E("CC_SL_NO_AGENTS"):
     _rows = order_agents(agents)
     _more = 0
     if AGENT_MAX > 0 and len(_rows) > AGENT_MAX:
-        _more, _rows = len(_rows) - AGENT_MAX, _rows[:AGENT_MAX]
+        # This turn's agents win the cut. Rows sort by start time, so a carried
+        # agent is by construction the oldest and would otherwise hold a slot
+        # forever while the work you are actually waiting on falls into
+        # "+N more". Keep tree order among the survivors.
+        _keep = set()
+        for _r in [r for r in _rows if not r.get("foreign")] + \
+                  [r for r in _rows if r.get("foreign")]:
+            if len(_keep) >= AGENT_MAX:
+                break
+            _keep.add(id(_r))
+        _more = len(_rows) - len(_keep)
+        _rows = [r for r in _rows if id(r) in _keep]
     _fam = (dig("model", "display_name", default="") or "").strip().split(" ")[0].lower()
     _win = int(num(dig("context_window", "context_window_size"), 0))
     agent_lines = compose_agents(_rows, agent_cost, _fam, _win)

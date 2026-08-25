@@ -533,5 +533,64 @@ check("but their shares are recorded, so the split is auditable",
       all(r[2] > 0 for r in conc), True)
 shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
 
+print("\n[17] an agent carried across a turn boundary must not over-claim")
+
+# An async agent outlives the turn that spawned it. Its rows are keyed
+# (session, prompt, agent) so it arrives in the NEW turn with no prior w_last --
+# and its first paid interval would credit it with its whole LIFETIME weight
+# instead of what it did this turn. Seeding at first sight is what prevents that,
+# and the seed has to be written even on an unpaid interval or it re-arms.
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+d = db("carry")
+CARRY = {"CC_SL_AGENT_CARRY": "1800"}
+seed = asst("cm", 10, 0, "s1")
+big = asst("cm", 400000, 0, "b1")          # w = 1.25 * 400012 = 500015
+small = asst("cm", 1000, 0, "g1")          # a further 1.25 * 1001 = 1251.25
+
+write_parent(pid="T1")
+write_agent("F", [seed], pid="T1")
+run(d, "S", "T1", 0.01, tr=AT, env=CARRY)          # first sight of T1, spent 0
+write_agent("F", [seed, big], pid="T1")
+run(d, "S", "T1", 1.01, tr=AT, env=CARRY)          # +$1.00, F alone
+check("baseline: F earns its own turn", round(agent_rows(d).get("F", -1), 4), 1.0)
+
+# T2 begins. F's file still carries T1's promptId -- it is foreign now, and live.
+write_parent(pid="T2")
+run(d, "S", "T2", 1.01, tr=AT, env=CARRY)          # first sight of T2, spent 0
+run(d, "S", "T2", 2.01, tr=AT, env=CARRY)          # +$1.00, F did NOT grow
+c = sqlite3.connect(d)
+t2 = dict(c.execute("SELECT agent_id, cost FROM agent WHERE prompt_id='T2'"))
+c.close()
+check("a carried agent claims nothing for growth it did last turn",
+      round(t2.get("F", -1), 4), 0.0)
+check("that money banks on the parent instead", round(t2.get("", -1), 4), 1.0)
+
+# Now it actually does something in T2 -- only that should be priced.
+write_agent("F", [seed, big, small], pid="T1")
+run(d, "S", "T2", 3.01, tr=AT, env=CARRY)          # +$1.00, F grew by 1251.25w
+c = sqlite3.connect(d)
+t2 = dict(c.execute("SELECT agent_id, cost FROM agent WHERE prompt_id='T2'"))
+w2 = c.execute("SELECT w_last FROM agent WHERE prompt_id='T2' AND agent_id='F'"
+               ).fetchone()
+c.close()
+check("real work in the new turn is credited", round(t2.get("F", -1), 4), 1.0)
+check("and the seed left w_last at lifetime, not zero",
+      round(float(w2[0]), 2) if w2 else None, round(1.25 * 401013, 2))
+
+# Liveness gates existence now, not just the tick, so the window is separate
+# from AGENT_STALE and generous on purpose.
+d2 = db("carrystale")
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+write_parent(pid="T1")
+write_agent("F", [seed, big], pid="T1")
+run(d2, "S", "T1", 0.01, tr=AT, env=CARRY)
+write_parent(pid="T2")
+run(d2, "S", "T2", 0.02, tr=AT, env={"CC_SL_AGENT_CARRY": "0"})
+c = sqlite3.connect(d2)
+rows = [r[0] for r in c.execute("SELECT agent_id FROM agent WHERE prompt_id='T2'")]
+c.close()
+check("CC_SL_AGENT_CARRY=0 disables carrying entirely", sorted(rows), [""])
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+
 print("\n%s  (%d pass, %d fail)" % ("ALL PASS" if not FAIL else "FAILURES", OK, FAIL))
 sys.exit(1 if FAIL else 0)

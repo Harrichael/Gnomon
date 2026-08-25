@@ -590,6 +590,54 @@ if g.returncode == 0:
 else:
     print("  SKIP  git unavailable")
 
+print("\n[7f] agents carried in from an earlier turn")
+
+# A background agent outlives the turn that spawned it, which is exactly when
+# its row matters -- you cannot see it working any other way. Its file still
+# carries the OLD promptId, so it is foreign to the turn being rendered.
+wipe()
+LIVE = dict(stop="tool_use")
+agent("carry", "AAA", [AA("claude-fable-5", 2, 400, 9000, 900, mid="c1",
+                          stop="tool_use")], name="Long running thing")
+rc, o = run(payload("BBB", 5000, tr=AT))
+r = rows(o)
+check("a live agent from an earlier turn still gets a row", len(r), 1)
+check("marked as carried, not as finished",
+      ("↩" in r[0], "✓" in r[0]), (True, False))
+
+# Trap: its uploads belong to the turn that spawned it. Line 2 must not move.
+check("line 2 ⇧ does NOT absorb a foreign agent's uploads", grab(o, "⇧"), "100")
+
+# Finished work from three prompts ago is noise, not information.
+wipe()
+agent("done", "AAA", [AA("claude-fable-5", 2, 400, 9000, 900, mid="d1")],
+      name="Already finished")
+rc, o = run(payload("BBB", 5000, tr=AT))
+check("a FINISHED foreign agent is not carried", len(rows(o)), 0)
+
+# The window is its own knob, generous on purpose, and disableable.
+wipe()
+agent("off", "AAA", [AA("claude-fable-5", 2, 400, 9000, 900, mid="o1",
+                        stop="tool_use")], name="Live but not wanted")
+rc, o = run(payload("BBB", 5000, tr=AT), env={"CC_SL_AGENT_CARRY": "0"})
+check("CC_SL_AGENT_CARRY=0 turns carrying off", len(rows(o)), 0)
+
+# This turn's work wins the cut. A carried agent starts earliest, so without
+# this it holds a slot forever while what you are waiting on falls off.
+wipe()
+agent("old", "AAA", [AA("claude-fable-5", 1, 10, 0, 5, mid="x1",
+                        stop="tool_use")], name="Carried", t0="2026-08-20T19:00:00.000Z")
+for i in (1, 2):
+    agent("new%d" % i, "BBB", [AA("claude-opus-5", 1, 10, 0, 5, mid="n%d" % i,
+                                  stop="tool_use")], name="This turn %d" % i,
+          t0="2026-08-20T20:0%d:00.000Z" % i)
+rc, o = run(payload("BBB", 5000, tr=AT), env={"CC_SL_AGENT_MAX": "2"})
+r = rows(o)
+check("the carried row is the one dropped, not this turn's",
+      [("This turn" in x) for x in r if "⇉" in x], [True, True])
+check("and the overflow is counted", "+1 more" in ANSI.sub("", o), True)
+wipe()
+
 print("\n[8] timing")
 pl = json.dumps(payload("CCC", 5000))
 e = dict(os.environ, HOME=HOME, COLUMNS="200", CC_SL_NO_API="1", CC_SL_NO_GIT="1", CC_SL_NO_K8S="1", TMPDIR=T)
