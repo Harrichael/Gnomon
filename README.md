@@ -115,6 +115,13 @@ so a stale clone installs a silent downgrade. The installer prints
 git it records `commit=unknown` and installs anyway — this has to work from a
 tarball.
 
+Several checkouts of this repo on one machine is a legitimate arrangement, not a
+smell: one place installs are made from, another where you develop, and a package
+registry may hold its own clone as a development *source*. None of them announce
+which one is deployed, so the provenance file is the thing that disambiguates
+them — `cat ~/.claude/gnomon.provenance` beats inferring it from directory names,
+which is how two sessions once spent an afternoon reading the wrong copy.
+
 **No database setup.** `~/.claude/gnomon-state.db` is created on the first
 redraw, tables and all, and every schema change since has been an
 `IF NOT EXISTS` or a guarded `ALTER`. There is nothing to migrate and nothing to
