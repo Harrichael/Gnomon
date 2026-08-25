@@ -5,7 +5,10 @@ tests/*.jsonl
 tests/*.db
 tests/*.db-wal
 tests/*.db-shm
-tests/cc-sl-usage-*.json
+tests/cc-sl-*
+tests/tr_sub/
+tests/ag/
+tests/gitrepo/
 
 # Local Claude Code overrides for this directory
 .claude/settings.local.json
