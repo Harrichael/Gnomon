@@ -35,6 +35,11 @@ check "settings.json written from nothing" \
   "python3 ~/.claude/gnomon.py"
 check "installer does not create the state DB" \
   "$([ -f "$H/.claude/gnomon-state.db" ] && echo yes || echo no)" "no"
+# Any clone can deploy; the sidecar is what makes a stale-clone deploy legible.
+check "provenance names the deploying repo" \
+  "$(grep '^source=' "$H/.claude/gnomon.provenance" 2>/dev/null)" "source=$REPO"
+check "provenance records a commit" \
+  "$(grep -c '^commit=[0-9a-f]\{7,\}$' "$H/.claude/gnomon.provenance" 2>/dev/null)" "1"
 
 echo
 echo "[2] idempotent -- three runs converge, they do not accumulate"
@@ -47,9 +52,11 @@ cat > "$H/.claude/settings.json" <<'JSON'
   "permissions": {"allow": ["Bash(ls:*)"]}
 }
 JSON
-run "$H"; A="$(shasum < "$H/.claude/settings.json")"
-run "$H"; B="$(shasum < "$H/.claude/settings.json")"
-run "$H"; C="$(shasum < "$H/.claude/settings.json")"
+run "$H"; A="$(shasum < "$H/.claude/settings.json")$(shasum < "$H/.claude/gnomon.provenance")"
+run "$H"; B="$(shasum < "$H/.claude/settings.json")$(shasum < "$H/.claude/gnomon.provenance")"
+run "$H"; C="$(shasum < "$H/.claude/settings.json")$(shasum < "$H/.claude/gnomon.provenance")"
+# Both artifacts, not just settings.json -- the sidecar carries no timestamp
+# precisely so that it converges too.
 check "runs 2 and 3 change nothing" "$([ "$A" = "$B" ] && [ "$B" = "$C" ] && echo same || echo drifted)" "same"
 check "unrelated top-level keys survive" \
   "$(python3 -c "import json;d=json.load(open('$H/.claude/settings.json'));print(d['theme'],d['permissions']['allow'][0])")" \
@@ -88,6 +95,33 @@ check "and tuned values still converge across runs" \
 check "virgin install seeds the defaults" \
   "$(python3 -c "import json;d=json.load(open('$SANDBOX/virgin/.claude/settings.json'))['statusLine'];print(d['padding'],d['refreshInterval'])")" \
   "0 10"
+
+echo
+echo "[2b] provenance degrades rather than failing"
+# Must survive a tarball with no .git and no network -- the git probe is
+# best-effort, and losing it costs the commit, never the install.
+NOGIT="$SANDBOX/nogit-repo"; cp -R "$REPO" "$NOGIT"; rm -rf "$NOGIT/.git"
+H="$SANDBOX/nogit"; mkdir -p "$H"
+run "$H" "$NOGIT"; check "install still exits 0 without .git" "$?" "0"
+check "script still deployed" \
+  "$([ -f "$H/.claude/gnomon.py" ] && echo yes || echo no)" "yes"
+check "provenance says so rather than lying" \
+  "$(grep '^commit=' "$H/.claude/gnomon.provenance" 2>/dev/null)" "commit=unknown"
+# install.sh normalises its own path with `cd && pwd`; $TMPDIR can carry a
+# trailing slash, so normalise the expectation the same way rather than
+# comparing raw strings.
+check "and still names the source" \
+  "$(grep '^source=' "$H/.claude/gnomon.provenance" 2>/dev/null)" \
+  "source=$(cd "$NOGIT" && pwd)"
+
+# A dirty source is legal but must be recorded -- "why does the deployed script
+# not match what I shipped" is exactly the question this answers.
+DIRTY="$SANDBOX/dirty-repo"; cp -R "$REPO" "$DIRTY"
+printf '\n# local edit\n' >> "$DIRTY/gnomon.py"
+H="$SANDBOX/dirtyhome"; mkdir -p "$H"
+run "$H" "$DIRTY"
+check "a dirty checkout is flagged" \
+  "$(grep '^dirty=' "$H/.claude/gnomon.provenance" 2>/dev/null)" "dirty=yes"
 
 echo
 echo "[3] malformed settings.json -- refuse, and change nothing"

@@ -21,6 +21,7 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="$HOME/.claude/gnomon.py"
 SETTINGS="$HOME/.claude/settings.json"
+PROV="$HOME/.claude/gnomon.provenance"
 STAGED="$SETTINGS.staged.$$"
 SMOKE="$(mktemp -d "${TMPDIR:-/tmp}/gnomon-smoke.XXXXXX")"
 trap 'rm -f "$STAGED"; rm -rf "$SMOKE"' EXIT
@@ -90,10 +91,39 @@ with open(staged, "w") as f:
     f.write("\n")
 PY
 
+# Which clone did this? Any checkout anywhere can run this script and become the
+# deployed version; the smoke check proves it RUNS, not that it is current. A
+# stale clone therefore deploys a silent downgrade -- which nearly happened once,
+# from a local-only copy three commits behind. Record the source so the question
+# "where did this machine's status line come from" is answerable months later and
+# not only in the scrollback of whoever ran it.
+#
+# Best-effort: this must keep working from a tarball with no .git and no network.
+# Never stamped into gnomon.py itself -- that would make the deployed file differ
+# from the repo copy and break the byte-identical property that install
+# convergence and the deployed-vs-repo diff both rely on. Sidecar or nothing, and
+# no timestamp in it, so re-running converges.
+COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || true)"
+if [ -n "$COMMIT" ]; then
+  if [ -n "$(git -C "$HERE" status --porcelain 2>/dev/null || true)" ]; then
+    DIRTY=yes
+  else
+    DIRTY=no
+  fi
+  ORIGIN="$COMMIT"
+  [ "$DIRTY" = yes ] && ORIGIN="$COMMIT-dirty"
+else
+  COMMIT=unknown
+  DIRTY=unknown
+  ORIGIN="not a git checkout"
+fi
+
 # Both halves are known good. Commit them.
 cp "$HERE/gnomon.py" "$DEST"
 mv "$STAGED" "$SETTINGS"
+printf 'source=%s\ncommit=%s\ndirty=%s\n' "$HERE" "$COMMIT" "$DIRTY" > "$PROV"
 
 echo "registered statusLine in $SETTINGS"
+echo "deployed from $HERE @ $ORIGIN"
 echo "installed -> $DEST"
 echo "note: refreshInterval is read at startup, so restart open sessions."
