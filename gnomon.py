@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""cc-statusline — three-line Claude Code status line.
+"""gnomon — a three-line Claude Code status line that keeps books.
+
+Named for the sundial's pointer: the part of an instrument that shows the
+reading. From γιγνώσκω, "that which knows".
 
 Line 1  identity   model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
 Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added)  ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
@@ -74,7 +77,7 @@ Env knobs:
   CC_SL_STATE_TTL    seconds of session inactivity before its rows are GC'd
                      (default 604800). Only whole quiet sessions expire, and
                      never the running one.
-  CC_SL_STATE_DB     override the state file (default ~/.claude/statusline-state.db)
+  CC_SL_STATE_DB     override the state file (default ~/.claude/gnomon-state.db)
   CC_SL_RATE_FLOOR   weighted tokens a model must have behind it before its own
                      learned rate is trusted for a concurrent split (default
                      500000). Below it the pooled rate is used instead -- a thin
@@ -320,7 +323,7 @@ def ctx_bands(size):
 
 
 STATE_DB = os.path.expanduser(E("CC_SL_STATE_DB")
-                              or "~/.claude/statusline-state.db")
+                              or "~/.claude/gnomon-state.db")
 STATE_TTL = int(num(E("CC_SL_STATE_TTL"), 604800))
 # Ceiling on the backward transcript walk, in bytes.
 SCAN_CAP = int(num(E("CC_SL_SCAN_CAP"), 4 << 20))

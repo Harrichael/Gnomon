@@ -2,7 +2,7 @@ import json, os, re, subprocess, sys, time, shutil
 # Defaults to the deployed script; set SL_SCRIPT to test the repo copy
 # before installing it.
 SCRIPT = os.environ.get("SL_SCRIPT") or os.path.expanduser(
-    "~/.claude/statusline.py")
+    "~/.claude/gnomon.py")
 T = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.join(T, "home"); os.makedirs(os.path.join(HOME, ".claude"), exist_ok=True)
 ANSI = re.compile(r"\033\[[0-9;]*m")
@@ -109,7 +109,7 @@ check("five entries, two responses: ⇧ counts each once", grab(o, "⇧"), "1.1K
 # (2 here, where the truth is 40). Both are recorded BEFORE the fold gate;
 # moving them after it silently guts the parent's weight, which no visible
 # figure would reveal, so assert on the stored weight directly.
-DBP = os.path.join(HOME, ".claude", "statusline-state.db")
+DBP = os.path.join(HOME, ".claude", "gnomon-state.db")
 run(payload("DUP", 5000, cost=1.0, sid="DUPW", tr=DUP))   # first sight, spent 0
 run(payload("DUP", 5000, cost=2.0, sid="DUPW", tr=DUP))   # paid: w_last advances
 _c = __import__("sqlite3").connect(DBP)
@@ -121,7 +121,7 @@ check("parent weight folds reads, takes max output",
       round(1.25 * 1100 + 0.1 * (5000 + 6000) + 5.0 * (40 + 77), 1))
 
 print("\n[2] cost delta")
-db = os.path.join(HOME, ".claude", "statusline-state.db")
+db = os.path.join(HOME, ".claude", "gnomon-state.db")
 for f in (db, db + "-wal", db + "-shm"):
     if os.path.exists(f): os.remove(f)
 rc, o = run(payload("CCC", 5000, cost=5.0, sid="FRESH"))
@@ -306,7 +306,7 @@ def agent_w(aid, sid):
     """
     run(payload("BBB", 5000, cost=1.0, sid=sid, tr=AT))
     run(payload("BBB", 5000, cost=2.0, sid=sid, tr=AT))
-    c = sqlite3.connect(os.path.join(HOME, ".claude", "statusline-state.db"))
+    c = sqlite3.connect(os.path.join(HOME, ".claude", "gnomon-state.db"))
     r = c.execute("SELECT w_last FROM agent WHERE session_id=? AND agent_id=?",
                   (sid, aid)).fetchone()
     c.close()

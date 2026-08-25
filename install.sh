@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Deploy the status line: copy the script into ~/.claude and register it in
-# settings.json. Idempotent -- safe to re-run after editing statusline.py.
+# Deploy gnomon: copy the script into ~/.claude and register it in
+# settings.json. Idempotent -- safe to re-run after editing gnomon.py.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEST="$HOME/.claude/statusline.py"
+DEST="$HOME/.claude/gnomon.py"
 SETTINGS="$HOME/.claude/settings.json"
 
 # Test the repo copy before it becomes the live one.
-SL_SCRIPT="$HERE/statusline.py" python3 "$HERE/tests/test_render.py"
-SL_SCRIPT="$HERE/statusline.py" python3 "$HERE/tests/test_cost_state.py"
+SL_SCRIPT="$HERE/gnomon.py" python3 "$HERE/tests/test_render.py"
+SL_SCRIPT="$HERE/gnomon.py" python3 "$HERE/tests/test_cost_state.py"
 
 mkdir -p "$HOME/.claude"
-cp "$HERE/statusline.py" "$DEST"
+cp "$HERE/gnomon.py" "$DEST"
 
 python3 - "$SETTINGS" <<'PY'
 import collections, json, os, sys
@@ -22,7 +22,7 @@ if os.path.exists(p):
         d = json.load(f, object_pairs_hook=collections.OrderedDict)
 # Merge rather than overwrite: settings.json holds unrelated preferences.
 sl = d.get("statusLine") or collections.OrderedDict()
-sl.update({"type": "command", "command": "python3 ~/.claude/statusline.py",
+sl.update({"type": "command", "command": "python3 ~/.claude/gnomon.py",
            "padding": 0, "refreshInterval": 10})
 d["statusLine"] = sl
 with open(p, "w") as f:

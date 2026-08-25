@@ -1,6 +1,12 @@
-# cc-statusline
+# gnomon
 
-A three-line status line for Claude Code. Python 3, standard library only.
+A three-line status line for Claude Code that keeps books. Python 3, standard
+library only.
+
+Named for the sundial's pointer — the part of an instrument that shows you the
+reading. Most status lines print numbers; this one accounts for them: a per-turn
+ledger that reconciles, per-model rates learned from your own usage rather than a
+hardcoded price table, and one row per subagent showing where the work went.
 
 ```
 Opus 5 (1M context) [high] ~/install
@@ -8,13 +14,13 @@ Opus 5 (1M context) [high] ~/install
 5h ●●◔○○ 46% ↻51m │ 7d ●○○○○○○ 15% ↻4d5h │ fable ◕○○○○○○ 12% ↻4d5h
 ```
 
-`statusline.py`'s module docstring is the reference for what every glyph means,
+`gnomon.py`'s module docstring is the reference for what every glyph means,
 how line 3's colours are derived, and all `CC_SL_*` env knobs. This file covers
 layout, install, and the invariants that are easy to break by accident.
 
 ## Layout
 
-    statusline.py            the whole thing; deployed to ~/.claude/statusline.py
+    gnomon.py                the whole thing; deployed to ~/.claude/gnomon.py
     install.sh               runs the tests, then installs + registers it
     tests/test_render.py     105 checks: rendering, subagent rows, widths, degradation
     tests/test_cost_state.py  53 checks: cost baselines, per-agent attribution, GC
@@ -43,9 +49,9 @@ rendering one renders the other.
 
 ## Install
 
-    ./statusline/install.sh
+    ./gnomon/install.sh
 
-Copies the script to `~/.claude/statusline.py` and merges a `statusLine` block
+Copies the script to `~/.claude/gnomon.py` and merges a `statusLine` block
 into `~/.claude/settings.json` without disturbing other settings. It runs both
 suites against the repo copy first and aborts if either fails.
 
@@ -53,17 +59,17 @@ suites against the repo copy first and aborts if either fails.
 
 ## Tests
 
-    python3 statusline/tests/test_render.py
-    python3 statusline/tests/test_cost_state.py
+    python3 gnomon/tests/test_render.py
+    python3 gnomon/tests/test_cost_state.py
 
 By default both exercise the *deployed* script. Set `SL_SCRIPT` to point at a
 candidate instead:
 
-    SL_SCRIPT=statusline/statusline.py python3 statusline/tests/test_render.py
+    SL_SCRIPT=gnomon/gnomon.py python3 gnomon/tests/test_render.py
 
 Fixtures (transcripts, sandbox `HOME`s, scratch databases) are generated at run
 time inside `tests/` and are gitignored. Nothing touches the real
-`~/.claude/statusline-state.db`; `CC_SL_STATE_DB` redirects every write.
+`~/.claude/gnomon-state.db`; `CC_SL_STATE_DB` redirects every write.
 
 ## Invariants — each of these was a bug once
 
@@ -212,7 +218,7 @@ assertion alone. Deleting the response-fold gate in `turn_tokens`, or moving the
 
 ```sh
 python3 - <<'EOF'
-import io; s = io.open("statusline.py").read()
+import io; s = io.open("gnomon.py").read()
 io.open("/tmp/mut.py","w").write(s.replace(
     "                if rid in seen:\n                    continue\n                seen.add(rid)\n", ""))
 EOF

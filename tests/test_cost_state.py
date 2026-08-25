@@ -4,7 +4,7 @@ import json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time
 # Defaults to the deployed script; set SL_SCRIPT to test the repo copy
 # before installing it.
 SCRIPT = os.environ.get("SL_SCRIPT") or os.path.expanduser(
-    "~/.claude/statusline.py")
+    "~/.claude/gnomon.py")
 BASE = tempfile.mkdtemp(prefix="sl2-")
 OK = FAIL = 0
 
@@ -139,9 +139,9 @@ check("every session got its own +$0.50", [m.group(1) if m else None for m in de
 check("12 rows, no cross-session bleed", len(rows(d)), 12)
 
 print("\n[9] the live DB is never touched by a fixture run")
-before = open(os.path.expanduser("~/.claude/statusline-state.db"), "rb").read()
+before = open(os.path.expanduser("~/.claude/gnomon-state.db"), "rb").read()
 run(db("iso"), "8d64c573-079a-40dd-8aad-1f11d2ace44a", "4c66c4e5", 11.75)
-after = open(os.path.expanduser("~/.claude/statusline-state.db"), "rb").read()
+after = open(os.path.expanduser("~/.claude/gnomon-state.db"), "rb").read()
 check("CC_SL_STATE_DB isolates writes from the real DB", before == after, True)
 
 print("\n[10] degradation still intact")
