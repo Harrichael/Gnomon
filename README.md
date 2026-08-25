@@ -16,10 +16,24 @@ layout, install, and the invariants that are easy to break by accident.
 
     statusline.py            the whole thing; deployed to ~/.claude/statusline.py
     install.sh               runs the tests, then installs + registers it
-    tests/test_render.py     82 checks: rendering, subagent rows, widths, degradation
-    tests/test_cost_state.py 33 checks: cost baselines, per-agent attribution, GC
+    tests/test_render.py     105 checks: rendering, subagent rows, widths, degradation
+    tests/test_cost_state.py  53 checks: cost baselines, per-agent attribution, GC
     tests/fixtures/          a captured real stdin payload
     archive/                 pre-feature snapshot, kept from before git existed
+
+One glyph, one meaning, one order. A **single** arrow `↓` is a level — what is
+resident in a context window right now. **Double** arrows are flows: `⇧` is what
+was uploaded this turn. Every line leads with the level and follows with the
+upload, line 2 stating its level as a number and agent rows as a bar:
+
+    ⛁ ██░░░░░░░░ 23% of 1M │ ↓ 232.5K (+64.9K)  ⇧ 105.1K │ +458/-173 │ $11.76 …
+      ⇉ fable   ███░░░ 38%  ⇧ 75.6K  ⏱ 7m42s  (+$0.62)  Audit state schema ✓
+
+Agent rows carry no output column. A down arrow there read as the opposite of
+line 2's `↓` while meaning something unrelated, which is exactly the sort of
+false symmetry that makes a dense line unreadable. Generated tokens are the 5×
+term in `weigh()`, so `(+$…)` already tracks them — `out` is still collected and
+still prices the cost split, it simply is not drawn.
 
 Line 1 marks the working directory with `⌂` and the git branch with `⎇`, both
 overridable via `CC_SL_DIR_ICON` / `CC_SL_GIT_ICON` (set either to `""` to drop

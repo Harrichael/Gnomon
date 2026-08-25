@@ -3,7 +3,7 @@
 
 Line 1  identity   model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
 Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added)  ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
-Line 2b agents     ⇉ model  ███░░░ 38%  ⇧up  ⇩out  ⏱ran  (+$spent)  name ✓
+Line 2b agents     ⇉ model  ███░░░ 38%  ⇧up  ⏱ran  (+$spent)  name ✓
 Line 3  limits     5h ●●●◑○ 62% ↻2h11m │ 7d ●◑○○○○○ 23% ↻4d6h │ fable ●●●◑○○○ 51% ↻3d1h
 
 Line 2b appears once per subagent this turn and disappears when none ran. A turn
@@ -259,7 +259,6 @@ GITC = "\033[31m"              # branch
 GITN = "\033[2;33m"            # change count
 IN_C = "\033[38;5;69m"         # ↓ input tokens
 OUT_C = "\033[38;5;141m"       # ↑ output tokens
-GEN_C = "\033[38;5;108m"       # ⇩ tokens an agent generated
 MONEY = "\033[38;5;220m"
 GRY = "\033[38;5;243m"
 
@@ -1354,8 +1353,15 @@ def compose_agents(rows, costs, main_family, main_win, level=0):
     fixed, names = [], []
     for r in rows:
         head = "  " * (r["depth"] - 1) + f"{GRY}⇉{R} {ORANGE}{short_model(r['model'])}{R}"
+        # No output column here on purpose. A down arrow on this row read as the
+        # opposite of line 2's ↓ while meaning something unrelated -- ↓ is a
+        # LEVEL (context resident), an agent's output is a FLOW. Dropping it
+        # leaves one meaning per glyph and one order everywhere: level first
+        # (bar here, number on line 2), upload second. Generated tokens are the
+        # 5x term in weigh(), so (+$…) already tracks them; r["out"] is still
+        # collected and still prices the split.
         seg = [head, agent_bar(r["ctx"], agent_window(r, main_family, main_win)),
-               f"{OUT_C}⇧{R} {fmt_tok(r['up'])}", f"{GEN_C}⇩{R} {fmt_tok(r['out'])}"]
+               f"{OUT_C}⇧{R} {fmt_tok(r['up'])}"]
         if level < 4:
             t0, t1 = parse_ts(r.get("t0")), parse_ts(r.get("tend"))
             end = t1 if (r.get("done") and t1) else NOW

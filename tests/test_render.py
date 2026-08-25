@@ -296,6 +296,23 @@ def agent(aid, pid, entries, name="Agent", depth=1, par=None, meta=None, t0=TS):
             json.dump(meta, f)
 
 
+def agent_w(aid, sid):
+    """Weighted tokens stored for `aid`.
+
+    The ⇩ column is gone from the row, so the per-id output fold has no visible
+    observable left — but out still feeds weigh() and lands in agent.w_last.
+    Two runs: the first is first-sight (spent 0, w_last held back), the second
+    pays for the growth and advances it.
+    """
+    run(payload("BBB", 5000, cost=1.0, sid=sid, tr=AT))
+    run(payload("BBB", 5000, cost=2.0, sid=sid, tr=AT))
+    c = sqlite3.connect(os.path.join(HOME, ".claude", "statusline-state.db"))
+    r = c.execute("SELECT w_last FROM agent WHERE session_id=? AND agent_id=?",
+                  (sid, aid)).fetchone()
+    c.close()
+    return round(r[0], 1) if r else None
+
+
 def wipe():
     shutil.rmtree(os.path.join(T, "ag"), ignore_errors=True)
 
@@ -327,8 +344,10 @@ agent("bbb", "BBB", [AA("claude-fable-5", 2, 400, 9000, 4, mid="m1"),
                      AA("claude-fable-5", 2, 400, 9000, 883, mid="m1")], name="Dedupe")
 rc, o = run(payload("BBB", 5000, tr=AT))
 r0 = rows(o)[0]
-check("agent ⇩ takes max-per-id, not first or sum", "⇩ 883" in r0, True)
 check("agent ⇧ counts the response once", "⇧ 402" in r0, True)
+# up 402 (first-wins), cache_read 9000 (once per id), output max(4,883,883)=883
+check("output still takes max-per-id, not first or sum",
+      agent_w("bbb", "W1"), round(1.25 * 402 + 0.1 * 9000 + 5 * 883, 1))
 
 # non-contiguous duplicate ids must still fold
 wipe()
@@ -338,7 +357,9 @@ agent("ccc", "BBB", [AA("claude-fable-5", 0, 100, 0, 10, mid="mA"),
 rc, o = run(payload("BBB", 5000, tr=AT))
 r0 = rows(o)[0]
 check("non-contiguous ids fold correctly (⇧)", "⇧ 300" in r0, True)
-check("non-contiguous ids fold correctly (⇩)", "⇩ 75" in r0, True)
+# mA folds to max(10,55)=55, mB to 20 -> 75 output across two interleaved ids
+check("non-contiguous ids fold correctly (output)",
+      agent_w("ccc", "W2"), round(1.25 * 300 + 5 * 75, 1))
 
 # --- 4. the tick mark ---------------------------------------------------------
 wipe()
@@ -435,8 +456,10 @@ rc, o = run(payload("BBB", 5000, tr=AT))
 plain = [ANSI.sub("", l) for l in rows(o)]
 check("⇧ starts at the same column on every row",
       len({l.index("⇧") for l in plain}), 1)
-check("⇩ starts at the same column on every row",
-      len({l.index("⇩") for l in plain}), 1)
+check("⏱ starts at the same column on every row",
+      len({l.index("⏱") for l in plain}), 1)
+check("no down arrow survives on an agent row",
+      any("⇩" in l for l in plain), False)
 
 # --- 8. degradation: every case must still exit 0 -----------------------------
 wipe()
@@ -484,14 +507,22 @@ check("CC_SL_AGENT_MAX=0 shows them all", len([l for l in rows(o) if "⇉" in l]
 wipe()
 agent("s1", "BBB", [AA("claude-fable-5", 2, 400, 9000, 900, mid="q1")],
       name="A fairly long agent description")
-for cols, want in ((200, "full"), (100, "trunc"), (60, "none"), (46, "nocost")):
+# Thresholds moved narrower when the ⇩ column came off the row — the levels
+# still fire in the same order, just ~9 characters later.
+for cols, want in ((200, "full"), (100, None), (60, None),
+                   (42, "nocost"), (34, "notime")):
     rc, o = run(payload("BBB", 5000, tr=AT), cols=str(cols))
     r0 = ANSI.sub("", rows(o)[0])
     check("COLUMNS=%d row fits" % cols, len(r0) <= cols, True)
     if want == "full":
         check("COLUMNS=200 keeps the whole name", r0.endswith("description ✓"), True)
     if want == "nocost":
-        check("COLUMNS=46 drops the cost", "(+$" in r0, False)
+        check("COLUMNS=42 drops the cost", "(+$" in r0, False)
+        check("COLUMNS=42 still keeps the timer", "⏱" in r0, True)
+    if want == "notime":
+        check("COLUMNS=34 drops the timer too", "⏱" in r0, False)
+        check("COLUMNS=34 keeps model, bar and ⇧",
+              all(g in r0 for g in ("⇉", "░", "⇧")), True)
 rc, o = run(payload("BBB", 5000, tr=AT), cols="0")
 check("COLUMNS=0 disables shedding entirely",
       ANSI.sub("", rows(o)[0]).endswith("description ✓"), True)
