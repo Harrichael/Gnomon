@@ -78,6 +78,19 @@ run alone once. Everything else is right immediately.
 
 `refreshInterval` is read at startup, so **restart open sessions** after install.
 
+**Re-running is safe.** The installer converges rather than accumulating: it
+merges its four keys into `statusLine` and leaves everything else in
+`settings.json` alone, including keys inside `statusLine` it knows nothing about.
+Three consecutive runs produce a byte-identical file.
+
+**It is all-or-nothing.** The merged settings are staged before anything is
+copied, so a `settings.json` that cannot be parsed aborts with a plain-language
+message and leaves you exactly as you were. It used to fail halfway — script
+deployed, nothing registered, a raw `JSONDecodeError` as the only clue.
+
+`./install.sh --skip-tests` installs a copy already known good, skipping the ~18s
+of suites.
+
 **Uninstall:** delete `~/.claude/gnomon.py`, `~/.claude/gnomon-state.db*`, and
 the `statusLine` block from `~/.claude/settings.json`.
 
@@ -85,8 +98,16 @@ the `statusLine` block from `~/.claude/settings.json`.
 
     python3 tests/test_render.py
     python3 tests/test_cost_state.py
+    ./tests/test_install.sh
 
-By default both exercise the *deployed* script. Set `SL_SCRIPT` to point at a
+The first two cover what gnomon renders. The third covers what `install.sh` does
+to your machine — the part that can only be got wrong once, on someone else's
+laptop: a fresh `HOME` with no `~/.claude`, three runs converging rather than
+accumulating, and a malformed `settings.json` being refused without leaving a
+half-install behind. It runs `install.sh --skip-tests` throughout, since running
+the Python suites five more times costs 90 seconds and covers nothing new.
+
+By default the first two exercise the *deployed* script. Set `SL_SCRIPT` to point at a
 candidate instead:
 
     SL_SCRIPT=./gnomon.py python3 tests/test_render.py
