@@ -85,6 +85,10 @@ Env knobs:
   CC_SL_RATE_OUTLIER reject an interval whose implied price is off the
                      established rate by more than this factor (default 5,
                      0 disables). Only applies once the floor is cleared.
+  CC_SL_RATE_LOG=1   record every calibration sample to a `rate_sample` table
+                     in the state DB -- instrumentation for the rate
+                     compression noted above attribute(). Off by default, and
+                     the table is not created unless it is on.
   CC_SL_SCAN_CAP     bytes of transcript the turn scan may walk (default 4M)
   CC_SL_NO_STATE=1   skip SQLite entirely; drops the $ delta, keeps ↓/⇧
   CC_SL_NO_AGENTS=1  drop the per-subagent rows; output returns to three lines
@@ -339,6 +343,9 @@ AGENT_CTX = int(num(E("CC_SL_AGENT_CTX"), 200000))
 RATE_HALFLIFE = int(num(E("CC_SL_RATE_HALFLIFE"), 14 * 86400))
 RATE_FLOOR = float(num(E("CC_SL_RATE_FLOOR"), 500000))
 RATE_OUTLIER = float(num(E("CC_SL_RATE_OUTLIER"), 5))
+# Raw calibration samples, for diagnosing the rate compression documented above
+# attribute(). Off by default: this is instrumentation, not a feature.
+RATE_LOG = bool(E("CC_SL_RATE_LOG"))
 CK = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 SEP = f" {DIM}│{R} "
@@ -821,6 +828,7 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
     grew = [g for g in grew if g[3] > 0]
 
     share = {}
+    solo_accepted = False
     if spent > 0:
         if len(grew) == 1:
             aid, mdl, _w, dw = grew[0]
@@ -857,6 +865,7 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
                         "INSERT OR REPLACE INTO model_rate "
                         "(model, w, usd, n, updated_at) VALUES (?,?,?,?,?)",
                         (mdl, w0 + dw, u0 + spent, n0 + 1.0, NOW))
+                    solo_accepted = True
         elif len(grew) > 1:
             known, pool_w, pool_u = {}, 0.0, 0.0
             for m_, w_, u_ in con.execute("SELECT model, w, usd FROM model_rate"):
@@ -884,6 +893,25 @@ def attribute(con, sid, pid, spent, agents, parent_w, main_model):
             # money can land before the records that explain it — bank it on the
             # parent rather than lose it, or the parts stop summing to the turn.
             share[""] = spent
+
+        # Raw sample, one row per participant that grew. The rate table only
+        # keeps aggregates, so a compressed estimate cannot be told apart from a
+        # well-measured one after the fact -- and the diagnosis in the OPEN block
+        # above rests on three aggregate rows, which is not enough to write code
+        # against. This is the re-measure that block asks for, and it must never
+        # cost an attribution: any failure here is swallowed.
+        if RATE_LOG:
+            try:
+                con.executemany(
+                    "INSERT INTO rate_sample (ts, session_id, prompt_id,"
+                    " agent_id, model, dw, spent, share, movers, accepted)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    [(NOW, sid, pid, aid, mdl or "", dw, spent,
+                      share.get(aid, 0.0), len(grew),
+                      1 if (len(grew) == 1 and solo_accepted) else 0)
+                     for aid, mdl, _w, dw in grew])
+            except Exception:
+                pass
 
     out = {}
     for aid, _mdl, w in parts:
@@ -954,6 +982,20 @@ def cost_delta(sid, pid, cost_now, agents=(), parent_w=0.0, main_model=""):
                         "DEFAULT 0")
         except Exception:
             pass
+        if RATE_LOG:
+            # Created only when logging is on, so a table nobody reads never
+            # appears in a normal user's database.
+            con.execute("""CREATE TABLE IF NOT EXISTS rate_sample (
+                             ts         INTEGER NOT NULL,
+                             session_id TEXT NOT NULL,
+                             prompt_id  TEXT NOT NULL,
+                             agent_id   TEXT NOT NULL,
+                             model      TEXT NOT NULL,
+                             dw         REAL NOT NULL,
+                             spent      REAL NOT NULL,
+                             share      REAL NOT NULL,
+                             movers     INTEGER NOT NULL,
+                             accepted   INTEGER NOT NULL)""")
         row = con.execute("SELECT cost_start, cost_last FROM turn "
                           "WHERE session_id=? AND prompt_id=?", (sid, pid)).fetchone()
         if row is None:

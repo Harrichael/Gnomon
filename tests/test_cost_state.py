@@ -487,5 +487,51 @@ ar0 = split(d, "F3", env={"CC_SL_RATE_FLOOR": "0"})
 check("with the floor off, the thin rate dominates instead", ar0["A"] > 0.95, True)
 shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
 
+print("\n[16] calibration samples, for diagnosing the rate compression")
+
+
+def samples(db):
+    """Rows from rate_sample, or None when the table was never created."""
+    c = sqlite3.connect(db)
+    try:
+        r = c.execute("SELECT model, dw, spent, movers, accepted "
+                      "FROM rate_sample ORDER BY rowid").fetchall()
+    except sqlite3.OperationalError:
+        r = None
+    c.close()
+    return r
+
+
+LOG = {"CC_SL_RATE_LOG": "1"}
+
+# Instrumentation, not a feature: a normal database never grows the table.
+d = db("nolog")
+calib(d, "L0", "P1", "mm", 100000, 1.00)
+check("off by default, table not even created", samples(d), None)
+
+# w = 1.25 * (seed 11 + growth 800001) -- the raw pair the scatter needs
+d = db("log1")
+calib(d, "L1", "P1", "mm", 800000, 2.00, env=LOG)
+s = samples(d)
+check("a solo interval is recorded once", len(s or []), 1)
+check("with model, mover count and acceptance",
+      (s[0][0], s[0][3], s[0][4]) if s else None, ("mm", 1, 1))
+check("and the untouched dw/spent pair",
+      (round(s[0][1], 1), round(s[0][2], 4)) if s else None,
+      (round(1.25 * 800012, 1), 2.0))
+
+# A contaminated interval must still be VISIBLE -- excluded from the rate, kept
+# in the log. Being able to see what was rejected is the point of the exercise.
+d = db("log2")
+calib(d, "L2", "C1", "thin", 100000, 5.00, env=LOG)
+calib(d, "L2", "C2", "thick", 800000, 1.00, env=LOG)
+split(d, "L3", env=LOG)
+conc = [r for r in samples(d) if r[3] > 1]
+check("a concurrent interval records every mover", len(conc), 2)
+check("none of which calibrated", sorted(set(r[4] for r in conc)), [0])
+check("but their shares are recorded, so the split is auditable",
+      all(r[2] > 0 for r in conc), True)
+shutil.rmtree(os.path.join(BASE, "att"), ignore_errors=True)
+
 print("\n%s  (%d pass, %d fail)" % ("ALL PASS" if not FAIL else "FAILURES", OK, FAIL))
 sys.exit(1 if FAIL else 0)
