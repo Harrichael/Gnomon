@@ -572,6 +572,17 @@ def line1(env=None, cwd=None, nogit="1"):
     e.update(env or {})
     return run(d, env=e)[1].split("\n")[0]
 
+def line1_named(name):
+    d = payload("AAA", 1000)
+    if name is not None:
+        d["session_name"] = name
+    return run(d, env={"CC_SL_NO_STATE": "1", "CC_SL_NO_GIT": "1"})[1].split("\n")[0]
+
+check("session name leads line 1",
+      re.sub(r"\033\[[0-9;]*m", "", line1_named("quick-updates-d5")).startswith("quick-updates-d5 "), True)
+check("no session name, no leading gap",
+      re.sub(r"\033\[[0-9;]*m", "", line1_named(None))[:1] != " ", True)
+
 check("folder marker precedes the cwd", "⌂ /tmp" in line1(), True)
 check("empty CC_SL_DIR_ICON drops it, no stray space",
       line1(env={"CC_SL_DIR_ICON": ""}).endswith(" /tmp"), True)

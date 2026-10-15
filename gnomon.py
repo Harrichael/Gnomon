@@ -4,7 +4,7 @@
 Named for the sundial's pointer: the part of an instrument that shows the
 reading. From γιγνώσκω, "that which knows".
 
-Line 1  identity   model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
+Line 1  identity   name  model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
 Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added)  ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
 Line 2b agents     ⇉ model  ███░░░ 38%  ⇧up  ⏱ran  (+$spent)  name ✓
                    ✓ finished, ↩ still working but spawned in an EARLIER
@@ -405,7 +405,10 @@ cwd = dig("workspace", "current_dir", default="") or dig("cwd", default="") or "
 home = os.path.expanduser("~")
 cwd_disp = ("~" + cwd[len(home):]) if home and cwd.startswith(home) else cwd
 
-parts1 = [f"{ORANGE}{model}{R}"]
+session_name = dig("session_name", default="") or ""
+
+parts1 = [f"{B}{session_name}{R}"] if session_name else []
+parts1.append(f"{ORANGE}{model}{R}")
 if effort:
     parts1.append(f"{EFFORTC}[{effort}]{R}")
 if cwd_disp:
