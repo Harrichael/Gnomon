@@ -4,7 +4,7 @@
 Named for the sundial's pointer: the part of an instrument that shows the
 reading. From γιγνώσκω, "that which knows".
 
-Line 1  identity   name  model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)
+Line 1  identity   model [effort]  cwd  ⎈ kctx(ns)  git-branch (+changes)  session
 Line 2  session    ⛁ bar % of SIZE │ ↓ctx (+added)  ⇧up │ +add/-del │ $cost (+spent) ⏱ dur
 Line 2b agents     ⇉ model  ███░░░ 38%  ⇧up  ⏱ran  (+$spent)  name ✓
                    ✓ finished, ↩ still working but spawned in an EARLIER
@@ -405,10 +405,7 @@ cwd = dig("workspace", "current_dir", default="") or dig("cwd", default="") or "
 home = os.path.expanduser("~")
 cwd_disp = ("~" + cwd[len(home):]) if home and cwd.startswith(home) else cwd
 
-session_name = dig("session_name", default="") or ""
-
-parts1 = [f"{B}{session_name}{R}"] if session_name else []
-parts1.append(f"{ORANGE}{model}{R}")
+parts1 = [f"{ORANGE}{model}{R}"]
 if effort:
     parts1.append(f"{EFFORTC}[{effort}]{R}")
 if cwd_disp:
@@ -446,6 +443,25 @@ if not E("CC_SL_NO_GIT") and cwd:
         if changes:
             seg += f" {GITN}(+{changes}){R}"
         parts1.append(seg)
+
+# The name other sessions message this one by, not stdin's session_name, which
+# is the auto-generated chat title. It lives only in Claude Code's per-process
+# registry, an undocumented file, so any surprise there just drops the segment.
+def _peer_name(sid):
+    for p in glob.glob(os.path.join(home, ".claude", "sessions", "*.json")):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("sessionId") == sid:
+            name = d.get("name")
+            return name if isinstance(name, str) else ""
+    return ""
+
+peer = _peer_name(dig("session_id", default="")) if dig("session_id") else ""
+if peer:
+    parts1.append(f"{GRY}{peer}{R}")
 
 line1 = " ".join(parts1)
 

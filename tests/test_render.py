@@ -572,16 +572,25 @@ def line1(env=None, cwd=None, nogit="1"):
     e.update(env or {})
     return run(d, env=e)[1].split("\n")[0]
 
-def line1_named(name):
-    d = payload("AAA", 1000)
-    if name is not None:
-        d["session_name"] = name
+# The peer name comes from Claude Code's per-process registry, matched on
+# session_id; stdin's session_name is the chat title and must not show.
+SESS = os.path.join(HOME, ".claude", "sessions")
+os.makedirs(SESS, exist_ok=True)
+with open(os.path.join(SESS, "4242.json"), "w") as f:
+    json.dump({"pid": 4242, "sessionId": "S1", "name": "quick-updates-d5"}, f)
+with open(os.path.join(SESS, "4343.json"), "w") as f:
+    json.dump({"pid": 4343, "sessionId": "S2", "name": "someone-else"}, f)
+
+def line1_for(sid):
+    d = payload("AAA", 1000, sid=sid)
+    d["session_name"] = "A chat title"
     return run(d, env={"CC_SL_NO_STATE": "1", "CC_SL_NO_GIT": "1"})[1].split("\n")[0]
 
-check("session name leads line 1",
-      re.sub(r"\033\[[0-9;]*m", "", line1_named("quick-updates-d5")).startswith("quick-updates-d5 "), True)
-check("no session name, no leading gap",
-      re.sub(r"\033\[[0-9;]*m", "", line1_named(None))[:1] != " ", True)
+check("peer name ends line 1", line1_for("S1").endswith(" quick-updates-d5"), True)
+check("chat title never shows", "A chat title" in line1_for("S1"), False)
+check("unregistered session shows no name, no trailing gap",
+      line1_for("S9").endswith(" "), False)
+shutil.rmtree(SESS)
 
 check("folder marker precedes the cwd", "⌂ /tmp" in line1(), True)
 check("empty CC_SL_DIR_ICON drops it, no stray space",
